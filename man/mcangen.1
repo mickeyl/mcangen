@@ -1,0 +1,138 @@
+.TH MCANGEN 1 "2026-03-19" "mcangen 0.1.0" "User Commands"
+.SH NAME
+mcangen \- high-performance CAN bus frame generator
+.SH SYNOPSIS
+.B mcangen
+[\fIOPTIONS\fR] \fIINTERFACE\fR
+.SH DESCRIPTION
+.B mcangen
+sends CAN frames with configurable IDs, DLC, data patterns, and rate to a
+Linux SocketCAN interface. It is designed for testing and benchmarking CAN bus
+stacks and hardware.
+.PP
+Frames can use standard (11-bit) IDs, extended (29-bit) IDs, or a random mix
+of both. Data length codes range from 0 to 8 bytes. Payload bytes can be
+random, all zeros, all ones, or an incrementing counter. The frame rate can be
+set precisely or left unlimited for maximum throughput.
+.SH ARGUMENTS
+.TP
+.I INTERFACE
+CAN interface name (e.g. \fBcan0\fR, \fBvcan0\fR).
+.SH OPTIONS
+.TP
+.BR \-n ", " \-\-count " " \fIN\fR
+Exact number of frames to send. 0 means unlimited (default: \fB0\fR).
+.TP
+.BR \-r ", " \-\-rate " " \fIFPS\fR
+Target frames per second. 0 means send as fast as possible (default: \fB0\fR).
+.TP
+.BR \-\-dlc\-min " " \fIN\fR
+Minimum data length code, 0\(en8 (default: \fB0\fR).
+.TP
+.BR \-\-dlc\-max " " \fIN\fR
+Maximum data length code, 0\(en8 (default: \fB8\fR).
+.TP
+.BR \-\-id\-min " " \fIID\fR
+Minimum CAN ID in hex or decimal (default: \fB0x000\fR).
+.TP
+.BR \-\-id\-max " " \fIID\fR
+Maximum CAN ID in hex or decimal. Clamped to 0x7FF for standard or
+0x1FFFFFFF for extended IDs (default: \fB0x7FF\fR).
+.TP
+.BR \-\-id\-kind " " \fIMODE\fR
+ID type: \fBstandard\fR (11-bit), \fBextended\fR (29-bit), or \fBmixed\fR
+(default: \fBstandard\fR).
+.TP
+.BR \-\-id\-mode " " \fIMODE\fR
+How CAN IDs are selected: \fBrandom\fR or \fBsequential\fR
+(default: \fBrandom\fR).
+.TP
+.BR \-\-data\-mode " " \fIMODE\fR
+How frame data bytes are filled: \fBrandom\fR, \fBzero\fR, \fBcounter\fR,
+\fBsequence\fR, or \fBones\fR (default: \fBrandom\fR). In \fBsequence\fR mode
+the 8 payload bytes form a big-endian 64-bit sequence number starting at 0.
+.TP
+.BR \-s ", " \-\-seed " " \fISEED\fR
+RNG seed for reproducible runs. 0 uses a random seed (default: \fB0\fR).
+.TP
+.BR \-p ", " \-\-progress " " \fIN\fR
+Print a stats line to stderr every \fIN\fR frames. 0 prints only the final
+summary (default: \fB0\fR).
+.TP
+.BR \-q ", " \-\-quiet
+Suppress all output except errors.
+.TP
+.BR \-h ", " \-\-help
+Print help message and exit.
+.TP
+.BR \-V ", " \-\-version
+Print version and exit.
+.SH EXAMPLES
+Send 10000 random frames as fast as possible on can0:
+.PP
+.RS
+.nf
+mcangen can0 \-n 10000
+.fi
+.RE
+.PP
+Send at 500 fps with mixed standard and extended IDs:
+.PP
+.RS
+.nf
+mcangen vcan0 \-r 500 \-\-id\-kind mixed \-n 5000
+.fi
+.RE
+.PP
+Sequential IDs, fixed DLC of 4, counter payload, with progress:
+.PP
+.RS
+.nf
+mcangen can0 \-\-id\-mode sequential \-\-dlc\-min 4 \-\-dlc\-max 4 \\
+    \-\-data\-mode counter \-p 1000
+.fi
+.RE
+.PP
+Reproducible test run:
+.PP
+.RS
+.nf
+mcangen vcan0 \-n 5000 \-r 1000 \-\-seed 42
+.fi
+.RE
+.SH RATE LIMITING
+When \fB\-\-rate\fR is set, mcangen uses a hybrid sleep/busy-spin strategy for
+precise timing. For intervals longer than 2\ ms it sleeps for most of the wait
+and busy-spins the final millisecond. If the sender falls behind schedule, it
+resets rather than bursting to catch up.
+.PP
+When \fB\-\-rate\fR is 0 (the default), frames are sent back-to-back with no
+delay. Actual throughput will be limited by the kernel's send buffer and the
+CAN bus bitrate.
+.SH PERMISSIONS
+Sending CAN frames requires the \fBCAP_NET_RAW\fR capability. Either run as
+root or grant the capability:
+.PP
+.RS
+.nf
+sudo setcap cap_net_raw+ep /path/to/mcangen
+.fi
+.RE
+.SH EXIT STATUS
+.TP
+.B 0
+All frames sent successfully.
+.TP
+.B 1
+Error (invalid arguments, socket failure, or excessive write errors).
+.SH SEE ALSO
+.BR cangen (1),
+.BR candump (1),
+.BR cansend (1),
+.BR ip (8)
+.SH BUGS
+Report bugs at: https://github.com/mickeyl/mcangen/issues
+.SH AUTHOR
+Dr. Michael \(aqMickey\(aq Lauer <mickey@vanille\-media.de>
+.SH LICENSE
+MIT License. See the LICENSE file in the source distribution.
