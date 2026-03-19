@@ -4,6 +4,13 @@
 
 # mcangen
 
+[![CI](https://github.com/mickeyl/mcangen/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyl/mcangen/actions/workflows/ci.yml)
+[![Release](https://github.com/mickeyl/mcangen/actions/workflows/release.yml/badge.svg)](https://github.com/mickeyl/mcangen/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![crates.io](https://img.shields.io/crates/v/mcangen.svg)](https://crates.io/crates/mcangen)
+![Platform: Linux](https://img.shields.io/badge/platform-Linux-blue)
+![Rust](https://img.shields.io/badge/language-Rust-orange)
+
 High-performance CAN bus frame generator for Linux, built in Rust.
 
 ## Why?
