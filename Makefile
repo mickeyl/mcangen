@@ -10,7 +10,9 @@ MANDIR    ?= $(PREFIX)/share/man
 BIN       := target/release/mcangen
 SRC       := $(shell find src -name '*.rs') Cargo.toml Cargo.lock
 
-.PHONY: all build run blast test clean install uninstall fmt check clippy vcan man help
+VERSION   := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+
+.PHONY: all build run blast test clean install uninstall fmt check clippy vcan man release publish help
 
 all: help
 
@@ -56,6 +58,27 @@ uninstall:
 	rm -f $(BINDIR)/mcangen
 	rm -f $(MANDIR)/man1/mcangen.1
 
+release: build
+	@if git diff --quiet && git diff --cached --quiet; then \
+		echo "Working tree clean — tagging v$(VERSION)"; \
+	else \
+		echo "error: uncommitted changes — commit first"; exit 1; \
+	fi
+	@if git tag | grep -q "^v$(VERSION)$$"; then \
+		echo "error: tag v$(VERSION) already exists — bump version in Cargo.toml and man/mcangen.1"; exit 1; \
+	fi
+	git tag -a v$(VERSION) -m "v$(VERSION)"
+	git push --tags
+	@echo "Tagged and pushed v$(VERSION) — GitHub release workflow will build binaries."
+	@echo "Run 'make publish' to push to crates.io."
+
+publish:
+	cargo publish --dry-run
+	@echo ""
+	@echo "Dry run passed. Publishing v$(VERSION) to crates.io in 5s... (Ctrl-C to abort)"
+	@sleep 5
+	cargo publish
+
 clean:
 	cargo clean
 
@@ -75,9 +98,11 @@ help:
 	@echo "  check      cargo check"
 	@echo "  clippy     cargo clippy"
 	@echo "  clean      cargo clean"
+	@echo "  release    Tag v\$$VERSION, push tag, trigger GitHub release build"
+	@echo "  publish    Publish to crates.io (dry-run first, 5s to abort)"
 	@echo ""
 	@echo "Variables:"
-	@echo "  IFACE=$(IFACE)  COUNT=$(COUNT)  RATE=$(RATE)  PREFIX=$(PREFIX)"
+	@echo "  IFACE=$(IFACE)  COUNT=$(COUNT)  RATE=$(RATE)  PREFIX=$(PREFIX)  VERSION=$(VERSION)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make run RATE=500 COUNT=5000"
