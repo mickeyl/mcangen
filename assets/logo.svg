@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 200">
+  <defs>
+    <linearGradient id="busGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#1a1a2e"/>
+      <stop offset="100%" style="stop-color:#16213e"/>
+    </linearGradient>
+    <linearGradient id="wireGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#0f3460"/>
+      <stop offset="50%" style="stop-color:#e94560"/>
+      <stop offset="100%" style="stop-color:#0f3460"/>
+    </linearGradient>
+    <linearGradient id="pulseGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#e94560;stop-opacity:0"/>
+      <stop offset="40%" style="stop-color:#e94560;stop-opacity:1"/>
+      <stop offset="60%" style="stop-color:#e94560;stop-opacity:1"/>
+      <stop offset="100%" style="stop-color:#e94560;stop-opacity:0"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="2" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="strongGlow">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="640" height="200" rx="12" fill="url(#busGrad)"/>
+
+  <!-- CAN bus wires (CAN-H and CAN-L) -->
+  <line x1="20" y1="88" x2="200" y2="88" stroke="#0f3460" stroke-width="2" opacity="0.5"/>
+  <line x1="20" y1="112" x2="200" y2="112" stroke="#0f3460" stroke-width="2" opacity="0.5"/>
+
+  <!-- CAN signal waveform on CAN-H (dominant/recessive) -->
+  <polyline fill="none" stroke="#e94560" stroke-width="2.5" filter="url(#glow)" opacity="0.9"
+    points="20,88 35,88 35,68 55,68 55,88 62,88 62,68 74,68 74,88 78,88 78,68 98,68 98,88 110,88 110,68 118,68 118,88 130,88 130,68 138,68 138,88 145,88 145,68 165,68 165,88 170,88 170,68 178,68 178,88 200,88"/>
+
+  <!-- CAN signal waveform on CAN-L (inverted) -->
+  <polyline fill="none" stroke="#533483" stroke-width="2.5" filter="url(#glow)" opacity="0.9"
+    points="20,112 35,112 35,132 55,132 55,112 62,112 62,132 74,132 74,112 78,112 78,132 98,132 98,112 110,112 110,132 118,132 118,112 130,112 130,132 138,132 138,112 145,112 145,132 165,132 165,112 170,112 170,132 178,132 178,112 200,112"/>
+
+  <!-- Differential marker -->
+  <text x="110" y="160" font-family="monospace" font-size="10" fill="#533483" text-anchor="middle" opacity="0.6">CAN-H / CAN-L</text>
+
+  <!-- Speed lines -->
+  <line x1="195" y1="78" x2="220" y2="78" stroke="#e94560" stroke-width="1" opacity="0.3"/>
+  <line x1="190" y1="88" x2="225" y2="88" stroke="#e94560" stroke-width="1.5" opacity="0.4"/>
+  <line x1="195" y1="98" x2="220" y2="98" stroke="#e94560" stroke-width="1" opacity="0.3"/>
+  <line x1="190" y1="112" x2="225" y2="112" stroke="#533483" stroke-width="1.5" opacity="0.4"/>
+  <line x1="195" y1="122" x2="220" y2="122" stroke="#533483" stroke-width="1" opacity="0.3"/>
+
+  <!-- Title -->
+  <text x="400" y="82" font-family="monospace" font-weight="bold" font-size="52" fill="#e8e8e8" text-anchor="middle" letter-spacing="-1">mcangen</text>
+
+  <!-- Subtitle -->
+  <text x="400" y="112" font-family="monospace" font-size="14" fill="#e94560" text-anchor="middle">HIGH-PERFORMANCE CAN BUS FRAME GENERATOR</text>
+
+  <!-- Frame packet visualization -->
+  <!-- SOF -->
+  <rect x="265" y="130" width="8" height="16" rx="2" fill="#e94560" opacity="0.9" filter="url(#glow)"/>
+  <!-- ID field -->
+  <rect x="277" y="130" width="44" height="16" rx="2" fill="#533483" opacity="0.8"/>
+  <text x="299" y="142" font-family="monospace" font-size="8" fill="#e8e8e8" text-anchor="middle">ID</text>
+  <!-- DLC -->
+  <rect x="325" y="130" width="24" height="16" rx="2" fill="#0f3460" opacity="0.8"/>
+  <text x="337" y="142" font-family="monospace" font-size="8" fill="#e8e8e8" text-anchor="middle">DLC</text>
+  <!-- Data bytes -->
+  <rect x="353" y="130" width="100" height="16" rx="2" fill="#1a6e3a" opacity="0.7"/>
+  <text x="403" y="142" font-family="monospace" font-size="8" fill="#e8e8e8" text-anchor="middle">DATA[0..7]</text>
+  <!-- CRC -->
+  <rect x="457" y="130" width="36" height="16" rx="2" fill="#0f3460" opacity="0.8"/>
+  <text x="475" y="142" font-family="monospace" font-size="8" fill="#e8e8e8" text-anchor="middle">CRC</text>
+  <!-- EOF -->
+  <rect x="497" y="130" width="8" height="16" rx="2" fill="#e94560" opacity="0.9" filter="url(#glow)"/>
+
+  <!-- Repeated fading frames behind -->
+  <g opacity="0.15">
+    <rect x="265" y="152" width="8" height="12" rx="2" fill="#e94560"/>
+    <rect x="277" y="152" width="44" height="12" rx="2" fill="#533483"/>
+    <rect x="325" y="152" width="24" height="12" rx="2" fill="#0f3460"/>
+    <rect x="353" y="152" width="100" height="12" rx="2" fill="#1a6e3a"/>
+    <rect x="457" y="152" width="36" height="12" rx="2" fill="#0f3460"/>
+    <rect x="497" y="152" width="8" height="12" rx="2" fill="#e94560"/>
+  </g>
+  <g opacity="0.07">
+    <rect x="265" y="168" width="8" height="10" rx="2" fill="#e94560"/>
+    <rect x="277" y="168" width="44" height="10" rx="2" fill="#533483"/>
+    <rect x="325" y="168" width="24" height="10" rx="2" fill="#0f3460"/>
+    <rect x="353" y="168" width="100" height="10" rx="2" fill="#1a6e3a"/>
+    <rect x="457" y="168" width="36" height="10" rx="2" fill="#0f3460"/>
+    <rect x="497" y="168" width="8" height="10" rx="2" fill="#e94560"/>
+  </g>
+
+  <!-- Rust gear accent -->
+  <g transform="translate(590, 30) scale(0.4)" fill="#e94560" opacity="0.15">
+    <path d="M50,10 L55,25 L70,20 L65,35 L80,40 L65,45 L70,60 L55,55 L50,70 L45,55 L30,60 L35,45 L20,40 L35,35 L30,20 L45,25 Z"/>
+    <circle cx="50" cy="40" r="12" fill="url(#busGrad)"/>
+  </g>
+</svg>

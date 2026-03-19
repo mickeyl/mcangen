@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="mcangen logo" width="640">
+</p>
+
 # mcangen
 
 High-performance CAN bus frame generator for Linux, built in Rust.
