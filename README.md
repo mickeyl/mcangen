@@ -1,17 +1,53 @@
 # mcangen
 
-High-performance CAN bus frame generator for Linux. A fast, flexible
-replacement for `cangen` from can-utils, built in Rust for maximum throughput.
+High-performance CAN bus frame generator for Linux, built in Rust.
+
+## Why?
+
+If you develop or test anything that touches a CAN bus — automotive ECUs,
+J2534 passthru devices, OBD adapters, SocketCAN drivers, or CAN-to-IP
+gateways — you need a way to throw traffic at it. The venerable `cangen`
+from [can-utils](https://github.com/linux-can/can-utils) works, but it has
+limitations:
+
+- It can't hit high frame rates reliably — timing drifts at scale.
+- Mixing standard and extended IDs in one run requires scripting.
+- There's no built-in way to send an exact number of frames and stop, which
+  makes automated test scripts awkward.
+- There's no sequence-number mode to detect drops or reordering on the
+  receiving end.
+
+**mcangen** fixes all of that. It uses raw SocketCAN writes, a hybrid
+sleep/busy-spin rate limiter, and a fast xorshift PRNG to generate diverse
+CAN traffic at line rate or any precise target FPS — then stops at exactly
+the count you asked for.
+
+Typical use cases:
+
+- **Benchmarking** a CAN interface, driver, or J2534 device at maximum
+  throughput.
+- **Stress testing** a receiver to find buffer overflows, dropped frames,
+  or firmware crashes.
+- **Verifying frame counts** — send exactly *N* frames, compare what
+  arrived on the other side. (Hint: if your device counts a few more than
+  you sent, that's CAN bus retransmissions from arbitration losses — not a
+  bug.)
+- **Regression testing** with reproducible traffic — same seed, same
+  frames every time.
 
 ## Features
 
-- **Fast** — raw SocketCAN writes with zero-copy framing, optimized release build with LTO
-- **All frame types** — standard (11-bit) IDs, extended (29-bit) IDs, or a random mix
+- **Fast** — raw SocketCAN writes with zero-copy framing, release build
+  with LTO, single-threaded hot loop
+- **All frame types** — standard (11-bit) IDs, extended (29-bit) IDs, or a
+  random mix of both
 - **Configurable DLC** — any range from 0 to 8 bytes
-- **Data patterns** — random, zeros, ones (0xFF), incrementing counter, or 64-bit sequence number
-- **Precise rate control** — hybrid sleep/busy-spin for accurate FPS targeting
+- **Data patterns** — random, zeros, ones (0xFF), incrementing counter, or
+  64-bit big-endian sequence number
+- **Precise rate control** — hybrid sleep/busy-spin for accurate FPS
+  targeting from 1 fps to line rate
 - **Exact counts** — send a precise number of frames then stop
-- **Reproducible** — seed the RNG for deterministic output
+- **Reproducible** — seed the PRNG for deterministic, repeatable runs
 - **Minimal dependencies** — just `clap`, `libc`, `nix`, and `fastrand`
 
 ## Requirements
@@ -37,13 +73,13 @@ The binary is at `target/release/mcangen`.
 ## Installation
 
 ```bash
-make install        # installs to ~/.local/bin/mcangen
+make install                # installs to ~/.local/bin and man page
 ```
 
-Or copy the binary wherever you like:
+Or to a system-wide location:
 
 ```bash
-sudo install -Dm755 target/release/mcangen /usr/local/bin/mcangen
+make install PREFIX=/usr/local
 ```
 
 ## Usage
@@ -52,26 +88,55 @@ sudo install -Dm755 target/release/mcangen /usr/local/bin/mcangen
 mcangen [OPTIONS] <INTERFACE>
 ```
 
-### Quick examples
+### Examples
+
+**Blast a million frames as fast as possible and report progress:**
 
 ```bash
-# Send 10000 random frames as fast as possible
-mcangen can0 -n 10000
-
-# 500 fps, mixed standard + extended IDs
-mcangen vcan0 -r 500 --id-kind mixed -n 5000
-
-# Sequential IDs, fixed DLC of 4, counter payload
-mcangen can0 --id-mode sequential --dlc-min 4 --dlc-max 4 --data-mode counter -p 1000
-
-# Reproducible run
-mcangen vcan0 -n 5000 -r 1000 --seed 42
-
-# Full-speed blast with progress reporting
 mcangen can0 -n 1000000 -p 100000
 ```
 
-### Options
+**Send at exactly 500 fps with mixed standard and extended IDs:**
+
+```bash
+mcangen can0 -r 500 --id-kind mixed -n 5000
+```
+
+**Walk through every standard ID sequentially, fixed DLC of 4:**
+
+```bash
+mcangen can0 --id-mode sequential --id-min 0x000 --id-max 0x7FF \
+    --dlc-min 4 --dlc-max 4 -n 2048
+```
+
+**Use sequence numbers to detect drops on the receiver:**
+
+```bash
+mcangen can0 -n 50000 -r 10000 --data-mode sequence
+```
+
+On the receiving end, decode the 8 payload bytes as a big-endian u64.
+Any gap in the sequence means a dropped frame.
+
+**Reproducible test run (same seed = same frames):**
+
+```bash
+mcangen can0 -n 5000 -r 1000 --seed 42
+```
+
+**Extended IDs only, random data, no rate limit:**
+
+```bash
+mcangen can0 --id-kind extended --id-max 0x1FFFFFFF -n 100000
+```
+
+**Quiet mode for scripting (exit code only):**
+
+```bash
+mcangen can0 -n 10000 -q && echo "done"
+```
+
+### All options
 
 | Option | Description | Default |
 |---|---|---|
@@ -88,7 +153,30 @@ mcangen can0 -n 1000000 -p 100000
 | `-p, --progress N` | Print stats every N frames | `0` |
 | `-q, --quiet` | Suppress all output except errors | off |
 
+### Makefile targets
+
+Run `make` to see all available targets:
+
+```
+build      Build release binary
+run        Run with IFACE, COUNT, RATE, EXTRA
+blast      1M frames as fast as possible
+test       Quick smoke test (1000 frames @ 2000 fps)
+vcan       Create vcan0 virtual interface (requires sudo)
+man        View the man page
+install    Install binary and man page to PREFIX
+uninstall  Remove installed files
+fmt        cargo fmt
+check      cargo check
+clippy     cargo clippy
+clean      cargo clean
+```
+
+Override the interface: `make blast IFACE=vcan0`
+
 ### Testing with virtual CAN
+
+No hardware needed — use the kernel's virtual CAN driver:
 
 ```bash
 make vcan                   # set up vcan0 (requires sudo)
@@ -98,11 +186,22 @@ make blast IFACE=vcan0      # 1M frame throughput benchmark
 
 ## Permissions
 
-Sending raw CAN frames requires `CAP_NET_RAW`. Either run as root or:
+Sending raw CAN frames requires `CAP_NET_RAW`. Either run as root or
+grant the capability to the binary:
 
 ```bash
 sudo setcap cap_net_raw+ep target/release/mcangen
 ```
+
+## A note on frame counts
+
+If you send 1,000,000 frames and your receiver reports slightly more
+(e.g. 1,001,034), that's not a bug. CAN controllers automatically
+retransmit frames that lose bus arbitration or encounter errors. Each
+retransmission is a valid frame on the wire, so the receiver counts it.
+mcangen counts successful `write()` calls, which will always match
+`--count` exactly. The difference tells you how noisy or contested your
+bus is.
 
 ## Man page
 
@@ -110,12 +209,10 @@ sudo setcap cap_net_raw+ep target/release/mcangen
 man ./man/mcangen.1
 ```
 
-To install system-wide:
-
-```bash
-sudo install -Dm644 man/mcangen.1 /usr/local/share/man/man1/mcangen.1
-```
-
 ## License
 
 [MIT](LICENSE)
+
+## Author
+
+Dr. Michael 'Mickey' Lauer <mickey@vanille-media.de>

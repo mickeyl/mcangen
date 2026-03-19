@@ -12,7 +12,7 @@ SRC       := $(shell find src -name '*.rs') Cargo.toml Cargo.lock
 
 .PHONY: all build run blast test clean install uninstall fmt check clippy vcan man help
 
-all: build
+all: help
 
 build: $(BIN)
 
