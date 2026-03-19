@@ -83,6 +83,14 @@ The binary is at `target/release/mcangen`.
 
 ## Installation
 
+From crates.io:
+
+```bash
+cargo install mcangen
+```
+
+From source:
+
 ```bash
 make install                # installs to ~/.local/bin and man page
 ```
