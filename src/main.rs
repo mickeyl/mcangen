@@ -154,7 +154,10 @@ fn open_can_socket(ifname: &str) -> io::Result<i32> {
         let name_bytes = ifname.as_bytes();
         if name_bytes.len() >= libc::IFNAMSIZ {
             libc::close(fd);
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "interface name too long"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "interface name too long",
+            ));
         }
         ifr.ifr_name[..name_bytes.len()].copy_from_slice(name_bytes);
 
@@ -284,7 +287,10 @@ fn main() {
 
     // Validate
     if cli.dlc_min > cli.dlc_max {
-        eprintln!("error: --dlc-min ({}) must be <= --dlc-max ({})", cli.dlc_min, cli.dlc_max);
+        eprintln!(
+            "error: --dlc-min ({}) must be <= --dlc-max ({})",
+            cli.dlc_min, cli.dlc_max
+        );
         std::process::exit(1);
     }
 
@@ -295,7 +301,10 @@ fn main() {
     let id_min = cli.id_min.min(id_ceiling);
     let id_max = cli.id_max.min(id_ceiling);
     if id_min > id_max {
-        eprintln!("error: --id-min (0x{:X}) must be <= --id-max (0x{:X})", id_min, id_max);
+        eprintln!(
+            "error: --id-min (0x{:X}) must be <= --id-max (0x{:X})",
+            id_min, id_max
+        );
         std::process::exit(1);
     }
 
@@ -303,7 +312,10 @@ fn main() {
     let max_rate = cli.fps == 0;
 
     let fd = open_can_socket(&cli.interface).unwrap_or_else(|e| {
-        eprintln!("error: failed to open CAN socket on '{}': {}", cli.interface, e);
+        eprintln!(
+            "error: failed to open CAN socket on '{}': {}",
+            cli.interface, e
+        );
         eprintln!("hint: make sure the interface exists (ip link show) and you have CAP_NET_RAW");
         std::process::exit(1);
     });
