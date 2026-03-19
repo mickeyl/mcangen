@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 const AF_CAN: i32 = 29;
 const PF_CAN: i32 = AF_CAN;
 const CAN_RAW: i32 = 1;
-const SIOCGIFINDEX: libc::c_ulong = 0x8933;
+// libc::Ioctl is c_ulong on glibc, c_int on musl — use the alias for portability.
+const SIOCGIFINDEX: libc::Ioctl = 0x8933 as libc::Ioctl;
 
 const CAN_EFF_FLAG: u32 = 0x8000_0000;
 const CAN_SFF_MASK: u32 = 0x0000_07FF;
