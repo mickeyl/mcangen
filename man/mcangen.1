@@ -49,8 +49,14 @@ How CAN IDs are selected: \fBrandom\fR or \fBsequential\fR
 .TP
 .BR \-\-data\-mode " " \fIMODE\fR
 How frame data bytes are filled: \fBrandom\fR, \fBzero\fR, \fBcounter\fR,
-\fBsequence\fR, or \fBones\fR (default: \fBrandom\fR). In \fBsequence\fR mode
-the 8 payload bytes form a big-endian 64-bit sequence number starting at 0.
+\fBsequence\fR, \fBones\fR, or \fBquality\-test\fR (default: \fBrandom\fR).
+In \fBsequence\fR mode the 8 payload bytes form a big-endian 64-bit sequence
+number starting at 0. In \fBquality\-test\fR mode, payloads follow the
+CANcorder quality-test protocol: bytes 0\(en1 are the magic marker 0xCAFE,
+bytes 2\(en3 a big-endian 16-bit sequence number, bytes 4\(en5 a big-endian
+16-bit millisecond timestamp offset, byte 6 the test ID (see
+\fB\-\-test\-id\fR), and byte 7 an XOR checksum of bytes 0\(en6. DLC is forced
+to 8 in this mode.
 .TP
 .BR \-s ", " \-\-seed " " \fISEED\fR
 RNG seed for reproducible runs. 0 uses a random seed (default: \fB0\fR).
@@ -61,6 +67,27 @@ summary (default: \fB0\fR).
 .TP
 .BR \-q ", " \-\-quiet
 Suppress all output except errors.
+.TP
+.BR \-\-burst
+Enable burst mode: alternate between a high-rate and a low-rate phase,
+emulating the intermittent traffic pattern of ECU reprogramming sessions.
+Mutually exclusive with \fB\-\-rate\fR.
+.TP
+.BR \-\-burst\-high\-rate " " \fIFPS\fR
+Frames per second during the high-rate burst phase (default: \fB5000\fR).
+.TP
+.BR \-\-burst\-low\-rate " " \fIFPS\fR
+Frames per second during the low-rate idle phase (default: \fB50\fR).
+.TP
+.BR \-\-burst\-high\-ms " " \fIMS\fR
+Duration of the high-rate phase in milliseconds (default: \fB2000\fR).
+.TP
+.BR \-\-burst\-low\-ms " " \fIMS\fR
+Duration of the low-rate phase in milliseconds (default: \fB500\fR).
+.TP
+.BR \-\-test\-id " " \fIID\fR
+Test ID byte (0\(en255) embedded in \fBquality\-test\fR payloads. Allows
+multiple concurrent test runs to be distinguished (default: \fB0\fR).
 .TP
 .BR \-h ", " \-\-help
 Print help message and exit.
@@ -100,6 +127,33 @@ Reproducible test run:
 mcangen vcan0 \-n 5000 \-r 1000 \-\-seed 42
 .fi
 .RE
+.PP
+Burst mode \(em simulate ECU reprogramming traffic (2\ s at 5000\ fps, 500\ ms at 50\ fps):
+.PP
+.RS
+.nf
+mcangen can0 \-\-burst \-n 100000
+.fi
+.RE
+.PP
+Custom burst parameters (1\ s high at 10000\ fps, 200\ ms low at 100\ fps):
+.PP
+.RS
+.nf
+mcangen can0 \-\-burst \-\-burst\-high\-rate 10000 \\
+    \-\-burst\-low\-rate 100 \-\-burst\-high\-ms 1000 \\
+    \-\-burst\-low\-ms 200 \-n 50000
+.fi
+.RE
+.PP
+CANcorder quality-test protocol on ID 0x7E0:
+.PP
+.RS
+.nf
+mcangen can0 \-\-data\-mode quality\-test \-\-id\-min 0x7E0 \\
+    \-\-id\-max 0x7E0 \-r 1000 \-n 10000
+.fi
+.RE
 .SH RATE LIMITING
 When \fB\-\-rate\fR is set, mcangen uses a hybrid sleep/busy-spin strategy for
 precise timing. For intervals longer than 2\ ms it sleeps for most of the wait
@@ -109,6 +163,13 @@ resets rather than bursting to catch up.
 When \fB\-\-rate\fR is 0 (the default), frames are sent back-to-back with no
 delay. Actual throughput will be limited by the kernel's send buffer and the
 CAN bus bitrate.
+.SH BURST MODE
+When \fB\-\-burst\fR is given, mcangen cycles between a high-rate phase and a
+low-rate phase. This emulates the traffic pattern typical of ECU
+reprogramming: large blocks of data are transferred at high speed, followed
+by short idle periods while the ECU erases or programs flash. The default
+cycle is 2\ s at 5000\ fps / 500\ ms at 50\ fps. All four parameters are
+tuneable. Burst mode is mutually exclusive with \fB\-\-rate\fR.
 .SH PERMISSIONS
 Sending CAN frames requires the \fBCAP_NET_RAW\fR capability. Either run as
 root or grant the capability:

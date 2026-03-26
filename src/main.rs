@@ -62,6 +62,8 @@ enum DataMode {
     Sequence,
     /// All 0xFF
     Ones,
+    /// CANcorder quality-test protocol (0xCAFE magic + seq16 + timestamp16 + test-id + checksum)
+    QualityTest,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -131,6 +133,30 @@ struct Cli {
     /// Suppress all output except errors
     #[arg(short = 'q', long)]
     quiet: bool,
+
+    /// Enable burst mode: alternate between high-rate and low-rate periods (emulates ECU reprogramming)
+    #[arg(long)]
+    burst: bool,
+
+    /// Burst mode: frames per second during high-rate phase
+    #[arg(long, default_value_t = 5000)]
+    burst_high_rate: u64,
+
+    /// Burst mode: frames per second during low-rate phase
+    #[arg(long, default_value_t = 50)]
+    burst_low_rate: u64,
+
+    /// Burst mode: duration of high-rate phase in milliseconds
+    #[arg(long, default_value_t = 2000)]
+    burst_high_ms: u64,
+
+    /// Burst mode: duration of low-rate phase in milliseconds
+    #[arg(long, default_value_t = 500)]
+    burst_low_ms: u64,
+
+    /// Test ID byte for quality-test data mode (0–255)
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8))]
+    test_id: u8,
 }
 
 fn parse_hex_u32(s: &str) -> Result<u32, String> {
@@ -295,6 +321,33 @@ fn main() {
         std::process::exit(1);
     }
 
+    if cli.burst {
+        if cli.burst_high_rate == 0 {
+            eprintln!("error: --burst-high-rate must be > 0");
+            std::process::exit(1);
+        }
+        if cli.burst_low_rate == 0 {
+            eprintln!("error: --burst-low-rate must be > 0");
+            std::process::exit(1);
+        }
+        if cli.fps > 0 {
+            eprintln!("error: --rate and --burst are mutually exclusive; use --burst-high-rate and --burst-low-rate");
+            std::process::exit(1);
+        }
+    }
+
+    // Quality-test protocol requires exactly 8 data bytes
+    let dlc_min = if matches!(cli.data_mode, DataMode::QualityTest) {
+        8
+    } else {
+        cli.dlc_min
+    };
+    let dlc_max = if matches!(cli.data_mode, DataMode::QualityTest) {
+        8
+    } else {
+        cli.dlc_max
+    };
+
     let id_ceiling = match cli.id_kind {
         IdKind::Standard => CAN_SFF_MASK,
         IdKind::Extended | IdKind::Mixed => CAN_EFF_MASK,
@@ -332,27 +385,55 @@ fn main() {
     let mut seq_id = id_min;
     let mut counter: u8 = 0;
     let mut seqnum: u64 = 0;
+    let mut qt_seqnum: u16 = 0;
     let mut sent: u64 = 0;
     let mut errors: u64 = 0;
 
+    // Burst mode timing
+    let burst_high_interval = if cli.burst {
+        Duration::from_secs_f64(1.0 / cli.burst_high_rate as f64)
+    } else {
+        Duration::ZERO
+    };
+    let burst_low_interval = if cli.burst {
+        Duration::from_secs_f64(1.0 / cli.burst_low_rate as f64)
+    } else {
+        Duration::ZERO
+    };
+    let burst_high_dur = Duration::from_millis(cli.burst_high_ms);
+    let burst_low_dur = Duration::from_millis(cli.burst_low_ms);
+    let mut burst_phase_high = true;
+    let mut burst_phase_start: Instant;
+
     if !cli.quiet {
+        let rate_str = if cli.burst {
+            format!(
+                "burst {}/{} fps ({}ms/{}ms)",
+                cli.burst_high_rate, cli.burst_low_rate, cli.burst_high_ms, cli.burst_low_ms,
+            )
+        } else if max_rate {
+            "max".to_string()
+        } else {
+            format!("{} fps", cli.fps)
+        };
         eprintln!(
             "mcangen: iface={} count={} rate={} id_kind={:?} id_mode={:?} data={:?} ids=0x{:X}..0x{:X} dlc={}..{}",
             cli.interface,
             if unlimited { "unlimited".to_string() } else { cli.count.to_string() },
-            if max_rate { "max".to_string() } else { format!("{} fps", cli.fps) },
+            rate_str,
             cli.id_kind,
             cli.id_mode,
             cli.data_mode,
             id_min,
             id_max,
-            cli.dlc_min,
-            cli.dlc_max,
+            dlc_min,
+            dlc_max,
         );
     }
 
     let t_start = Instant::now();
     let mut next_send = t_start;
+    burst_phase_start = t_start;
 
     loop {
         if !unlimited && sent >= cli.count {
@@ -383,7 +464,7 @@ fn main() {
         };
 
         // ── DLC ──
-        frame.can_dlc = rng.range_u8(cli.dlc_min, cli.dlc_max).min(CAN_MAX_DLC);
+        frame.can_dlc = rng.range_u8(dlc_min, dlc_max).min(CAN_MAX_DLC);
 
         // ── Data ──
         match cli.data_mode {
@@ -405,13 +486,46 @@ fn main() {
                 frame.data[..8].copy_from_slice(&seqnum.to_be_bytes());
                 seqnum = seqnum.wrapping_add(1);
             }
+            DataMode::QualityTest => {
+                let elapsed_ms = t_start.elapsed().as_millis() as u16;
+                frame.data[0] = 0xCA;
+                frame.data[1] = 0xFE;
+                frame.data[2..4].copy_from_slice(&qt_seqnum.to_be_bytes());
+                frame.data[4..6].copy_from_slice(&elapsed_ms.to_be_bytes());
+                frame.data[6] = cli.test_id;
+                frame.data[7] = frame.data[..7].iter().fold(0u8, |acc, &b| acc ^ b);
+                qt_seqnum = qt_seqnum.wrapping_add(1);
+            }
         }
 
         // ── Rate limiting ──
-        if !max_rate {
+        if cli.burst {
+            // Check for phase transition
+            let phase_dur = if burst_phase_high {
+                burst_high_dur
+            } else {
+                burst_low_dur
+            };
+            if burst_phase_start.elapsed() >= phase_dur {
+                burst_phase_high = !burst_phase_high;
+                burst_phase_start = Instant::now();
+                next_send = burst_phase_start;
+            }
+
+            let current_interval = if burst_phase_high {
+                burst_high_interval
+            } else {
+                burst_low_interval
+            };
+            wait_until(next_send);
+            next_send += current_interval;
+            let now = Instant::now();
+            if next_send < now {
+                next_send = now + current_interval;
+            }
+        } else if !max_rate {
             wait_until(next_send);
             next_send += interval;
-            // If we've fallen behind, reset the schedule to avoid burst catch-up
             let now = Instant::now();
             if next_send < now {
                 next_send = now + interval;

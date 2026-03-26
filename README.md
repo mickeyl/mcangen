@@ -53,8 +53,10 @@ Typical use cases:
 - **All frame types** — standard (11-bit) IDs, extended (29-bit) IDs, or a
   random mix of both
 - **Configurable DLC** — any range from 0 to 8 bytes
-- **Data patterns** — random, zeros, ones (0xFF), incrementing counter, or
-  64-bit big-endian sequence number
+- **Data patterns** — random, zeros, ones (0xFF), incrementing counter,
+  64-bit big-endian sequence number, or CANcorder quality-test protocol
+- **Burst mode** — alternating high/low rate phases to emulate ECU
+  reprogramming traffic patterns
 - **Precise rate control** — hybrid sleep/busy-spin for accurate FPS
   targeting from 1 fps to line rate
 - **Exact counts** — send a precise number of frames then stop
@@ -149,6 +151,26 @@ mcangen can0 -n 5000 -r 1000 --seed 42
 mcangen can0 --id-kind extended --id-max 0x1FFFFFFF -n 100000
 ```
 
+**Burst mode — simulate ECU reprogramming traffic:**
+
+```bash
+mcangen can0 --burst -n 100000
+```
+
+Default cycle: 2 s at 5000 fps, then 500 ms at 50 fps, repeating.
+Customise with `--burst-high-rate`, `--burst-low-rate`, `--burst-high-ms`,
+`--burst-low-ms`.
+
+**CANcorder quality-test protocol on a fixed ID:**
+
+```bash
+mcangen can0 --data-mode quality-test --id-min 0x7E0 --id-max 0x7E0 -r 1000 -n 10000
+```
+
+Generates frames with the 0xCAFE magic marker, 16-bit sequence number,
+16-bit timestamp offset, test ID, and XOR checksum — ready for
+CANcorder's quality test panel.
+
 **Quiet mode for scripting (exit code only):**
 
 ```bash
@@ -167,10 +189,16 @@ mcangen can0 -n 10000 -q && echo "done"
 | `--id-max ID` | Maximum CAN ID (hex or decimal) | `0x7FF` |
 | `--id-kind MODE` | `standard`, `extended`, or `mixed` | `standard` |
 | `--id-mode MODE` | `random` or `sequential` | `random` |
-| `--data-mode MODE` | `random`, `zero`, `counter`, `sequence`, or `ones` | `random` |
+| `--data-mode MODE` | `random`, `zero`, `counter`, `sequence`, `ones`, or `quality-test` | `random` |
 | `-s, --seed SEED` | RNG seed (0 = random) | `0` |
 | `-p, --progress N` | Print stats every N frames | `0` |
 | `-q, --quiet` | Suppress all output except errors | off |
+| `--burst` | Enable burst mode (alternating high/low rate) | off |
+| `--burst-high-rate FPS` | High-rate phase FPS | `5000` |
+| `--burst-low-rate FPS` | Low-rate phase FPS | `50` |
+| `--burst-high-ms MS` | High-rate phase duration (ms) | `2000` |
+| `--burst-low-ms MS` | Low-rate phase duration (ms) | `500` |
+| `--test-id ID` | Test ID byte for `quality-test` mode (0–255) | `0` |
 
 ### Makefile targets
 
