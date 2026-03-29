@@ -114,7 +114,7 @@ mcangen [OPTIONS] <INTERFACE>
 **Blast a million frames as fast as possible and report progress:**
 
 ```bash
-mcangen can0 -n 1000000 -p 100000
+mcangen can0 -r 0 -n 1000000 -p 100000
 ```
 
 **Send at exactly 500 fps with mixed standard and extended IDs:**
@@ -148,7 +148,7 @@ mcangen can0 -n 5000 -r 1000 --seed 42
 **Extended IDs only, random data, no rate limit:**
 
 ```bash
-mcangen can0 --id-kind extended --id-max 0x1FFFFFFF -n 100000
+mcangen can0 --id-kind extended -r 0 -n 100000
 ```
 
 **Burst mode — simulate ECU reprogramming traffic:**
@@ -182,12 +182,13 @@ mcangen can0 -n 10000 -q && echo "done"
 | Option | Description | Default |
 |---|---|---|
 | `-n, --count N` | Number of frames to send (0 = unlimited) | `0` |
-| `-r, --rate FPS` | Target frames/sec (0 = max speed) | `0` |
+| `-r, --rate FPS` | Target frames/sec (0 = max speed) | `5` |
 | `--dlc-min N` | Minimum DLC (0–8) | `0` |
 | `--dlc-max N` | Maximum DLC (0–8) | `8` |
 | `--id-min ID` | Minimum CAN ID (hex or decimal) | `0x000` |
-| `--id-max ID` | Maximum CAN ID (hex or decimal) | `0x7FF` |
+| `--id-max ID` | Maximum CAN ID (hex or decimal) | `0x7FF` / `0x1FFFFFFF` |
 | `--id-kind MODE` | `standard`, `extended`, or `mixed` | `standard` |
+| `--ext-id-above-sff` | Keep extended IDs > 0x7FF to avoid misdetection | `true` |
 | `--id-mode MODE` | `random` or `sequential` | `random` |
 | `--data-mode MODE` | `random`, `zero`, `counter`, `sequence`, `ones`, or `quality-test` | `random` |
 | `-s, --seed SEED` | RNG seed (0 = random) | `0` |

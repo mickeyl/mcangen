@@ -1,4 +1,4 @@
-.TH MCANGEN 1 "2026-03-26" "mcangen 1.1.0" "User Commands"
+.TH MCANGEN 1 "2026-03-29" "mcangen 1.2.0" "User Commands"
 .SH NAME
 mcangen \- high-performance CAN bus frame generator
 .SH SYNOPSIS
@@ -24,7 +24,7 @@ CAN interface name (e.g. \fBcan0\fR, \fBvcan0\fR).
 Exact number of frames to send. 0 means unlimited (default: \fB0\fR).
 .TP
 .BR \-r ", " \-\-rate " " \fIFPS\fR
-Target frames per second. 0 means send as fast as possible (default: \fB0\fR).
+Target frames per second. 0 means send as fast as possible (default: \fB5\fR).
 .TP
 .BR \-\-dlc\-min " " \fIN\fR
 Minimum data length code, 0\(en8 (default: \fB0\fR).
@@ -37,11 +37,16 @@ Minimum CAN ID in hex or decimal (default: \fB0x000\fR).
 .TP
 .BR \-\-id\-max " " \fIID\fR
 Maximum CAN ID in hex or decimal. Clamped to 0x7FF for standard or
-0x1FFFFFFF for extended IDs (default: \fB0x7FF\fR).
+0x1FFFFFFF for extended/mixed IDs (default: \fB0x7FF\fR for standard,
+\fB0x1FFFFFFF\fR for extended/mixed).
 .TP
 .BR \-\-id\-kind " " \fIMODE\fR
 ID type: \fBstandard\fR (11-bit), \fBextended\fR (29-bit), or \fBmixed\fR
 (default: \fBstandard\fR).
+.TP
+.BR \-\-ext\-id\-above\-sff " " \fItrue\fR|\fIfalse\fR
+Ensure extended (29-bit) IDs are always greater than 0x7FF so they cannot be
+mistaken for standard (11-bit) IDs on the receiving side (default: \fBtrue\fR).
 .TP
 .BR \-\-id\-mode " " \fIMODE\fR
 How CAN IDs are selected: \fBrandom\fR or \fBsequential\fR
@@ -99,7 +104,7 @@ Send 10000 random frames as fast as possible on can0:
 .PP
 .RS
 .nf
-mcangen can0 \-n 10000
+mcangen can0 \-r 0 \-n 10000
 .fi
 .RE
 .PP
@@ -160,9 +165,9 @@ precise timing. For intervals longer than 2\ ms it sleeps for most of the wait
 and busy-spins the final millisecond. If the sender falls behind schedule, it
 resets rather than bursting to catch up.
 .PP
-When \fB\-\-rate\fR is 0 (the default), frames are sent back-to-back with no
+When \fB\-\-rate\fR is 0, frames are sent back-to-back with no
 delay. Actual throughput will be limited by the kernel's send buffer and the
-CAN bus bitrate.
+CAN bus bitrate. The default rate is 5\ fps, matching cangen's default 200\ ms gap.
 .SH BURST MODE
 When \fB\-\-burst\fR is given, mcangen cycles between a high-rate phase and a
 low-rate phase. This emulates the traffic pattern typical of ECU

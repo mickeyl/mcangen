@@ -91,7 +91,7 @@ struct Cli {
     count: u64,
 
     /// Target frames per second (0 = send as fast as possible)
-    #[arg(short = 'r', long = "rate", default_value_t = 0)]
+    #[arg(short = 'r', long = "rate", default_value_t = 5)]
     fps: u64,
 
     /// Minimum DLC (0–8)
@@ -106,13 +106,17 @@ struct Cli {
     #[arg(long, default_value = "0x000", value_parser = parse_hex_u32)]
     id_min: u32,
 
-    /// Maximum CAN ID (hex or decimal). Clamped to 0x7FF (standard) or 0x1FFFFFFF (extended).
-    #[arg(long, default_value = "0x7FF", value_parser = parse_hex_u32)]
-    id_max: u32,
+    /// Maximum CAN ID (hex or decimal). Defaults to 0x7FF (standard) or 0x1FFFFFFF (extended/mixed).
+    #[arg(long, value_parser = parse_hex_u32)]
+    id_max: Option<u32>,
 
     /// ID type: standard (11-bit), extended (29-bit), or mixed
     #[arg(long, value_enum, default_value_t = IdKind::Standard)]
     id_kind: IdKind,
+
+    /// Ensure extended (29-bit) IDs are always > 0x7FF so they can't be mistaken for standard IDs
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    ext_id_above_sff: bool,
 
     /// How CAN IDs are selected
     #[arg(long, value_enum, default_value_t = IdMode::Random)]
@@ -353,7 +357,7 @@ fn main() {
         IdKind::Extended | IdKind::Mixed => CAN_EFF_MASK,
     };
     let id_min = cli.id_min.min(id_ceiling);
-    let id_max = cli.id_max.min(id_ceiling);
+    let id_max = cli.id_max.unwrap_or(id_ceiling).min(id_ceiling);
     if id_min > id_max {
         eprintln!(
             "error: --id-min (0x{:X}) must be <= --id-max (0x{:X})",
@@ -458,7 +462,11 @@ fn main() {
         };
 
         frame.can_id = if use_extended {
-            (raw_id & CAN_EFF_MASK) | CAN_EFF_FLAG
+            let mut id = raw_id & CAN_EFF_MASK;
+            if cli.ext_id_above_sff && id <= CAN_SFF_MASK {
+                id = CAN_SFF_MASK + 1 + (id % (CAN_EFF_MASK - CAN_SFF_MASK));
+            }
+            id | CAN_EFF_FLAG
         } else {
             raw_id & CAN_SFF_MASK
         };

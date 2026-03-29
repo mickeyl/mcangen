@@ -26,7 +26,7 @@ run: $(BIN)
 
 # Send as fast as possible — good for throughput benchmarks
 blast: $(BIN)
-	./$(BIN) $(IFACE) -n 1000000 -p 100000 $(EXTRA)
+	./$(BIN) $(IFACE) -r 0 -n 1000000 -p 100000 $(EXTRA)
 
 # Quick smoke test: 1000 frames at 2000 fps with progress
 test: $(BIN)
