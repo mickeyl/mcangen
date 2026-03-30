@@ -93,6 +93,45 @@ Duration of the low-rate phase in milliseconds (default: \fB500\fR).
 .BR \-\-test\-id " " \fIID\fR
 Test ID byte (0\(en255) embedded in \fBquality\-test\fR payloads. Allows
 multiple concurrent test runs to be distinguished (default: \fB0\fR).
+.SS UDS Flash Mode
+.TP
+.BR \-\-uds\-flash
+Enable UDS flash simulation mode. Generates a realistic ECU reprogramming
+session directly on the CAN bus, with both tester and ECU frames visible.
+The session follows a 16-phase sequence: extended diagnostic session,
+ECU identification reads, programming session, security access (seed/key),
+communication control, DTC disable, programming precondition check,
+memory erase (with NRC 0x78 pending responses), firmware download request,
+multi-frame ISO-TP data transfer (50\(en150 blocks of 200\(en256 bytes),
+transfer exit, dependency check, DTC read/clear/verify, and ECU hard reset.
+.sp
+In this mode, \fB\-n\fR sets the number of sessions (0 = loop forever).
+Between sessions, OBD-II polling traffic is generated unless \fB\-\-no\-obd\fR
+is given. Mutually exclusive with \fB\-\-burst\fR. The options \fB\-\-rate\fR,
+\fB\-\-data\-mode\fR, \fB\-\-id\-*\fR, and \fB\-\-dlc\-*\fR are ignored.
+.TP
+.BR \-\-tester\-id " " \fIID\fR
+CAN ID for tester/diagnostic tool requests in UDS flash mode
+(default: \fB0x7E0\fR).
+.TP
+.BR \-\-ecu\-id " " \fIID\fR
+CAN ID for ECU responses in UDS flash mode (default: \fB0x7E8\fR).
+.TP
+.BR \-\-speed " " \fIFACTOR\fR
+Timing multiplier for UDS flash mode. Values above 1.0 speed up the
+simulation; values below 1.0 slow it down (default: \fB1.0\fR).
+.TP
+.BR \-\-transfer\-blocks " " \fIN\fR
+Number of data transfer blocks per UDS flash session. 0 picks a random
+count between 50 and 150 (default: \fB0\fR).
+.TP
+.BR \-\-no\-obd
+Skip OBD-II polling traffic between UDS flash sessions.
+.TP
+.BR \-\-no\-errors
+Disable error injection in UDS flash mode. Without this flag, the simulator
+occasionally injects busy retries (3%), security access failures (15%),
+wrong block sequence errors (2%), and response-pending delays (5%).
 .TP
 .BR \-h ", " \-\-help
 Print help message and exit.
@@ -159,6 +198,40 @@ mcangen can0 \-\-data\-mode quality\-test \-\-id\-min 0x7E0 \\
     \-\-id\-max 0x7E0 \-r 1000 \-n 10000
 .fi
 .RE
+.PP
+UDS flash simulation \(em single reprogramming session:
+.PP
+.RS
+.nf
+mcangen vcan0 \-\-uds\-flash \-n 1
+.fi
+.RE
+.PP
+UDS flash \(em double speed, 100 blocks, no errors:
+.PP
+.RS
+.nf
+mcangen can0 \-\-uds\-flash \-n 1 \-\-speed 2.0 \\
+    \-\-transfer\-blocks 100 \-\-no\-errors
+.fi
+.RE
+.PP
+UDS flash \(em custom IDs, no OBD polling, 3 sessions:
+.PP
+.RS
+.nf
+mcangen can0 \-\-uds\-flash \-\-tester\-id 0x641 \\
+    \-\-ecu\-id 0x642 \-\-no\-obd \-n 3
+.fi
+.RE
+.PP
+UDS flash \(em loop forever (Ctrl\-C to stop):
+.PP
+.RS
+.nf
+mcangen vcan0 \-\-uds\-flash
+.fi
+.RE
 .SH RATE LIMITING
 When \fB\-\-rate\fR is set, mcangen uses a hybrid sleep/busy-spin strategy for
 precise timing. For intervals longer than 2\ ms it sleeps for most of the wait
@@ -175,6 +248,58 @@ reprogramming: large blocks of data are transferred at high speed, followed
 by short idle periods while the ECU erases or programs flash. The default
 cycle is 2\ s at 5000\ fps / 500\ ms at 50\ fps. All four parameters are
 tuneable. Burst mode is mutually exclusive with \fB\-\-rate\fR.
+.SH UDS FLASH MODE
+When \fB\-\-uds\-flash\fR is given, mcangen generates a complete UDS (Unified
+Diagnostic Services) ECU reprogramming session directly on the CAN bus. Both
+the tester (diagnostic tool) and the ECU sides of the conversation are
+produced, so any CAN bus monitor or application under test sees realistic
+bidirectional traffic with proper ISO-TP segmentation and timing.
+.PP
+A session consists of 16 phases:
+.IP 1. 4
+Enter extended diagnostic session (0x10/0x03)
+.IP 2. 4
+Read ECU identification: VIN, serial, SW/HW version, part number (0x22, multi-frame)
+.IP 3. 4
+Enter programming session (0x10/0x02)
+.IP 4. 4
+Security access with seed & key exchange (0x27)
+.IP 5. 4
+Disable normal communication (0x28)
+.IP 6. 4
+Disable DTC setting (0x85)
+.IP 7. 4
+Check programming preconditions (0x31, routine 0xFF00)
+.IP 8. 4
+Erase memory with response-pending (0x31, routine 0xFF01, NRC 0x78)
+.IP 9. 4
+Request download for 256\ KB at address 0x00080000 (0x34)
+.IP 10. 4
+Transfer data blocks via multi-frame ISO-TP (0x36, 50\(en150 blocks)
+.IP 11. 4
+Request transfer exit (0x37)
+.IP 12. 4
+Check programming dependencies (0x31, routine 0xFF02)
+.IP 13. 4
+Read and clear DTCs (0x19, 0x14), verify cleared
+.IP 14. 4
+ECU hard reset (0x11)
+.PP
+Unless \fB\-\-no\-errors\fR is given, the simulator occasionally injects
+negative responses with automatic retries: busy repeat request (NRC 0x21),
+conditions not correct (NRC 0x22), invalid security key (NRC 0x35), wrong
+block sequence counter (NRC 0x73), and response pending (NRC 0x78).
+.PP
+Between sessions (unless \fB\-\-no\-obd\fR), OBD-II polling traffic is
+generated using functional addressing (0x7DF) with responses on the
+configured ECU ID. Polled PIDs include engine RPM (0x0C), coolant
+temperature (0x05), vehicle speed (0x0D), and throttle position (0x11),
+with simulated sensor values that drift over time.
+.PP
+For more sophisticated ECU simulation with custom services, security
+algorithms, and configurable identifiers, see the
+.B ECUmulator
+project.
 .SH PERMISSIONS
 Sending CAN frames requires the \fBCAP_NET_RAW\fR capability. Either run as
 root or grant the capability:

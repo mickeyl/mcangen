@@ -55,6 +55,9 @@ Typical use cases:
 - **Configurable DLC** — any range from 0 to 8 bytes
 - **Data patterns** — random, zeros, ones (0xFF), incrementing counter,
   64-bit big-endian sequence number, or CANcorder quality-test protocol
+- **UDS flash simulation** — realistic ECU reprogramming session with
+  proper ISO-TP framing, security access, memory erase, firmware transfer,
+  DTC handling, and ECU reset — both tester and ECU sides on the bus
 - **Burst mode** — alternating high/low rate phases to emulate ECU
   reprogramming traffic patterns
 - **Precise rate control** — hybrid sleep/busy-spin for accurate FPS
@@ -151,7 +154,34 @@ mcangen can0 -n 5000 -r 1000 --seed 42
 mcangen can0 --id-kind extended -r 0 -n 100000
 ```
 
-**Burst mode — simulate ECU reprogramming traffic:**
+**UDS flash simulation — realistic ECU reprogramming session on the bus:**
+
+```bash
+mcangen vcan0 --uds-flash -n 1
+```
+
+Generates a full 16-phase UDS reprogramming session: diagnostic session
+control, ECU identification reads, security access (seed/key), memory
+erase with pending responses, multi-frame ISO-TP firmware transfer
+(50–150 blocks), DTC read/clear/verify, and ECU reset. Both tester and
+ECU frames appear on the bus with realistic timing.
+
+```bash
+# Double speed, fixed 100 blocks, no error injection
+mcangen can0 --uds-flash -n 1 --speed 2.0 --transfer-blocks 100 --no-errors
+
+# Loop forever with OBD-II polling between sessions
+mcangen vcan0 --uds-flash
+
+# Custom arbitration IDs, skip inter-session OBD traffic
+mcangen can0 --uds-flash --tester-id 0x641 --ecu-id 0x642 --no-obd -n 3
+```
+
+In UDS flash mode, `-n` sets the number of sessions (0 = loop forever).
+Between sessions, OBD-II polling traffic (PIDs on 0x7DF) is generated
+with drifting vehicle state unless `--no-obd` is given.
+
+**Burst mode — simulate ECU reprogramming traffic pattern:**
 
 ```bash
 mcangen can0 --burst -n 100000
@@ -200,6 +230,13 @@ mcangen can0 -n 10000 -q && echo "done"
 | `--burst-high-ms MS` | High-rate phase duration (ms) | `2000` |
 | `--burst-low-ms MS` | Low-rate phase duration (ms) | `500` |
 | `--test-id ID` | Test ID byte for `quality-test` mode (0–255) | `0` |
+| `--uds-flash` | UDS flash simulation mode (see below) | off |
+| `--tester-id ID` | [UDS flash] Tester request CAN ID | `0x7E0` |
+| `--ecu-id ID` | [UDS flash] ECU response CAN ID | `0x7E8` |
+| `--speed FACTOR` | [UDS flash] Timing multiplier (2.0 = double speed) | `1.0` |
+| `--transfer-blocks N` | [UDS flash] Blocks per session (0 = random 50–150) | `0` |
+| `--no-obd` | [UDS flash] Skip OBD-II polling between sessions | off |
+| `--no-errors` | [UDS flash] Disable error injection | off |
 
 ### Makefile targets
 

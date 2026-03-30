@@ -161,6 +161,37 @@ struct Cli {
     /// Test ID byte for quality-test data mode (0–255)
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8))]
     test_id: u8,
+
+    /// UDS flash mode: simulate a realistic ECU reprogramming session.
+    /// Both tester and ECU frames appear on the bus with proper ISO-TP
+    /// framing and timing.  In this mode, -n sets the number of sessions
+    /// (0 = loop forever).
+    #[arg(long, verbatim_doc_comment)]
+    uds_flash: bool,
+
+    /// [UDS flash] Tester request CAN ID (hex or decimal)
+    #[arg(long, default_value = "0x7E0", value_parser = parse_hex_u32)]
+    tester_id: u32,
+
+    /// [UDS flash] ECU response CAN ID (hex or decimal)
+    #[arg(long, default_value = "0x7E8", value_parser = parse_hex_u32)]
+    ecu_id: u32,
+
+    /// [UDS flash] Timing multiplier (2.0 = double speed, 0.5 = half)
+    #[arg(long, default_value_t = 1.0)]
+    speed: f64,
+
+    /// [UDS flash] Transfer blocks per session (0 = random 50–150)
+    #[arg(long, default_value_t = 0)]
+    transfer_blocks: u32,
+
+    /// [UDS flash] Skip OBD-II polling between sessions
+    #[arg(long)]
+    no_obd: bool,
+
+    /// [UDS flash] Disable error injection (clean sessions only)
+    #[arg(long)]
+    no_errors: bool,
 }
 
 fn parse_hex_u32(s: &str) -> Result<u32, String> {
@@ -288,6 +319,26 @@ impl Rng {
         let span = (hi - lo + 1) as u32;
         lo + (self.next_u32() % span) as u8
     }
+
+    fn uniform(&mut self, lo: f64, hi: f64) -> f64 {
+        let t = (self.next() >> 11) as f64 / (1u64 << 53) as f64;
+        lo + t * (hi - lo)
+    }
+
+    fn delay_us(&mut self, lo_ms: f64, hi_ms: f64) -> u64 {
+        (self.uniform(lo_ms, hi_ms) * 1000.0) as u64
+    }
+
+    fn chance(&mut self, p: f64) -> bool {
+        self.uniform(0.0, 1.0) < p
+    }
+
+    fn fill_bytes(&mut self, buf: &mut [u8]) {
+        for chunk in buf.chunks_mut(8) {
+            let r = self.next().to_ne_bytes();
+            chunk.copy_from_slice(&r[..chunk.len()]);
+        }
+    }
 }
 
 // ── Precise rate-limited sleep ─────────────────────────────────────────────
@@ -308,6 +359,508 @@ fn wait_until(target: Instant) {
     // Busy-spin the final stretch for accuracy
     while Instant::now() < target {
         std::hint::spin_loop();
+    }
+}
+
+// ── UDS Flash simulation ──────────────────────────────────────────────────
+
+const ISOTP_PAD: u8 = 0xCC;
+
+struct TimedFrame {
+    can_id: u32, // 0 = delay-only marker (no frame sent)
+    data: [u8; 8],
+    pre_delay_us: u64,
+}
+
+// ── ISO-TP framing helpers ────────────────────────────────────────────────
+
+fn push_sf(frames: &mut Vec<TimedFrame>, can_id: u32, payload: &[u8], delay_us: u64) {
+    debug_assert!(payload.len() <= 7);
+    let mut data = [ISOTP_PAD; 8];
+    data[0] = payload.len() as u8;
+    data[1..1 + payload.len()].copy_from_slice(payload);
+    frames.push(TimedFrame { can_id, data, pre_delay_us: delay_us });
+}
+
+fn push_nrc(frames: &mut Vec<TimedFrame>, ecu: u32, sid: u8, nrc: u8, delay_us: u64) {
+    push_sf(frames, ecu, &[0x7F, sid, nrc], delay_us);
+}
+
+fn push_multi(
+    frames: &mut Vec<TimedFrame>,
+    sender: u32,
+    responder: u32,
+    payload: &[u8],
+    ff_delay_us: u64,
+    fc_delay_us: u64,
+    cf_delay_us: u64,
+) {
+    let total = payload.len();
+
+    // First Frame
+    let mut ff = [0u8; 8];
+    ff[0] = 0x10 | ((total >> 8) & 0x0F) as u8;
+    ff[1] = (total & 0xFF) as u8;
+    let n = total.min(6);
+    ff[2..2 + n].copy_from_slice(&payload[..n]);
+    frames.push(TimedFrame { can_id: sender, data: ff, pre_delay_us: ff_delay_us });
+
+    // Flow Control
+    let mut fc = [ISOTP_PAD; 8];
+    fc[0] = 0x30;
+    fc[1] = 0x00; // block_size = unlimited
+    fc[2] = 0x0A; // st_min = 10 ms
+    frames.push(TimedFrame { can_id: responder, data: fc, pre_delay_us: fc_delay_us });
+
+    // Consecutive Frames
+    let mut off = 6;
+    let mut seq = 1u8;
+    while off < total {
+        let mut cf = [ISOTP_PAD; 8];
+        cf[0] = 0x20 | (seq & 0x0F);
+        let end = (off + 7).min(total);
+        cf[1..1 + end - off].copy_from_slice(&payload[off..end]);
+        frames.push(TimedFrame { can_id: sender, data: cf, pre_delay_us: cf_delay_us });
+        off += 7;
+        seq = (seq + 1) & 0x0F;
+    }
+}
+
+// ── UDS session phases ────────────────────────────────────────────────────
+
+fn gen_session_control(
+    f: &mut Vec<TimedFrame>, tester: u32, ecu: u32,
+    session: u8, errors: bool, rng: &mut Rng,
+) {
+    let req = [0x10, session];
+    if errors && rng.chance(0.03) {
+        push_sf(f, tester, &req, rng.delay_us(20.0, 50.0));
+        push_nrc(f, ecu, 0x10, 0x21, rng.delay_us(15.0, 30.0)); // busy
+        push_sf(f, tester, &req, rng.delay_us(100.0, 200.0));     // retry
+    } else {
+        push_sf(f, tester, &req, rng.delay_us(20.0, 50.0));
+    }
+    // P2=25ms, P2*=5000ms
+    push_sf(f, ecu, &[0x50, session, 0x00, 0x19, 0x01, 0xF4], rng.delay_us(15.0, 40.0));
+}
+
+fn gen_read_identification(
+    f: &mut Vec<TimedFrame>, tester: u32, ecu: u32, rng: &mut Rng,
+) {
+    const IDS: [(u16, &[u8]); 5] = [
+        (0xF190, b"WVWZZZ3CZWE123456"),  // VIN
+        (0xF18C, b"ECU12345678"),         // Serial Number
+        (0xF195, b"SW_V02.15.003"),       // Software Version
+        (0xF193, b"HW_REV_C"),            // Hardware Version
+        (0xF187, b"PART_1K0907115B"),     // Part Number
+    ];
+    for &(did, val) in &IDS {
+        push_sf(f, tester,
+            &[0x22, (did >> 8) as u8, did as u8], rng.delay_us(30.0, 80.0));
+
+        let mut resp = Vec::with_capacity(3 + val.len());
+        resp.extend_from_slice(&[0x62, (did >> 8) as u8, did as u8]);
+        resp.extend_from_slice(val);
+
+        if resp.len() <= 7 {
+            push_sf(f, ecu, &resp, rng.delay_us(10.0, 30.0));
+        } else {
+            push_multi(f, ecu, tester, &resp,
+                rng.delay_us(10.0, 30.0), rng.delay_us(5.0, 15.0), rng.delay_us(5.0, 15.0));
+        }
+    }
+}
+
+fn gen_security_access(
+    f: &mut Vec<TimedFrame>, tester: u32, ecu: u32,
+    errors: bool, rng: &mut Rng,
+) {
+    let lvl: u8 = 0x11; // programming security level
+    if errors && rng.chance(0.15) {
+        // Failed first attempt
+        push_sf(f, tester, &[0x27, lvl], rng.delay_us(20.0, 40.0));
+        let s = rng.next_u32().to_be_bytes();
+        push_sf(f, ecu, &[0x67, lvl, s[0], s[1], s[2], s[3]], rng.delay_us(100.0, 200.0));
+        let k = rng.next_u32().to_be_bytes(); // wrong key
+        push_sf(f, tester, &[0x27, lvl + 1, k[0], k[1], k[2], k[3]], rng.delay_us(50.0, 100.0));
+        push_nrc(f, ecu, 0x27, 0x35, rng.delay_us(30.0, 80.0)); // invalidKey
+        f.push(TimedFrame { can_id: 0, data: [0; 8], pre_delay_us: rng.delay_us(500.0, 1000.0) });
+    }
+    // Successful attempt
+    push_sf(f, tester, &[0x27, lvl], rng.delay_us(20.0, 40.0));
+    let s = rng.next_u32().to_be_bytes();
+    push_sf(f, ecu, &[0x67, lvl, s[0], s[1], s[2], s[3]], rng.delay_us(100.0, 250.0));
+    let key = [s[0] ^ 0xCA, s[1] ^ 0xCA, s[2] ^ 0xCA, s[3] ^ 0xCA];
+    push_sf(f, tester, &[0x27, lvl + 1, key[0], key[1], key[2], key[3]], rng.delay_us(50.0, 100.0));
+    push_sf(f, ecu, &[0x67, lvl + 1], rng.delay_us(80.0, 200.0));
+}
+
+fn gen_check_preconditions(
+    f: &mut Vec<TimedFrame>, tester: u32, ecu: u32,
+    errors: bool, rng: &mut Rng,
+) {
+    let req = [0x31, 0x01, 0xFF, 0x00]; // routine 0xFF00
+    if errors && rng.chance(0.02) {
+        push_sf(f, tester, &req, rng.delay_us(30.0, 60.0));
+        push_nrc(f, ecu, 0x31, 0x22, rng.delay_us(20.0, 50.0)); // conditionsNotCorrect
+        f.push(TimedFrame { can_id: 0, data: [0; 8], pre_delay_us: rng.delay_us(300.0, 600.0) });
+        push_sf(f, tester, &req, rng.delay_us(30.0, 60.0)); // retry
+    } else {
+        push_sf(f, tester, &req, rng.delay_us(30.0, 60.0));
+    }
+    push_sf(f, ecu, &[0x71, 0x01, 0xFF, 0x00, 0x00], rng.delay_us(50.0, 150.0));
+}
+
+fn gen_erase_memory(f: &mut Vec<TimedFrame>, tester: u32, ecu: u32, rng: &mut Rng) {
+    // Routine 0xFF01, addr 0x00080000, size 0x00040000
+    let payload: [u8; 13] = [
+        0x31, 0x01, 0xFF, 0x01, 0x44,
+        0x00, 0x08, 0x00, 0x00,
+        0x00, 0x04, 0x00, 0x00,
+    ];
+    push_multi(f, tester, ecu, &payload,
+        rng.delay_us(20.0, 40.0), rng.delay_us(5.0, 15.0), rng.delay_us(5.0, 15.0));
+
+    // Pending responses while flash is being erased
+    let num_pending = rng.range_u32(3, 8);
+    for _ in 0..num_pending {
+        push_nrc(f, ecu, 0x31, 0x78, rng.delay_us(400.0, 700.0)); // responsePending
+    }
+    push_sf(f, ecu, &[0x71, 0x01, 0xFF, 0x01, 0x00], rng.delay_us(300.0, 600.0));
+}
+
+fn gen_request_download(f: &mut Vec<TimedFrame>, tester: u32, ecu: u32, rng: &mut Rng) {
+    // No compression/encryption, 4-byte addr + 4-byte size
+    let payload: [u8; 11] = [
+        0x34, 0x00, 0x44,
+        0x00, 0x08, 0x00, 0x00,
+        0x00, 0x04, 0x00, 0x00,
+    ];
+    push_multi(f, tester, ecu, &payload,
+        rng.delay_us(20.0, 40.0), rng.delay_us(5.0, 15.0), rng.delay_us(5.0, 15.0));
+    // max block length 258
+    push_sf(f, ecu, &[0x74, 0x20, 0x01, 0x02], rng.delay_us(30.0, 80.0));
+}
+
+fn gen_transfer_data(
+    f: &mut Vec<TimedFrame>, tester: u32, ecu: u32,
+    num_blocks: usize, errors: bool, rng: &mut Rng,
+) {
+    let mut ctr: u8 = 0;
+    let mut error_done = false;
+
+    for i in 0..num_blocks {
+        ctr = ctr.wrapping_add(1);
+        let bsz = rng.range_u32(200, 256) as usize;
+
+        // Random "firmware" payload: [SID=0x36, blockCounter, data…]
+        let mut payload = vec![0x36, ctr];
+        let start = payload.len();
+        payload.resize(start + bsz, 0);
+        rng.fill_bytes(&mut payload[start..]);
+
+        // One-shot error injection per session
+        if errors && !error_done && i > 5 && rng.chance(0.02) {
+            error_done = true;
+            let wrong = ctr.wrapping_add(rng.range_u8(1, 5));
+            let mut bad = payload.clone();
+            bad[1] = wrong;
+            push_multi(f, tester, ecu, &bad,
+                rng.delay_us(15.0, 30.0), rng.delay_us(3.0, 8.0), rng.delay_us(3.0, 8.0));
+            push_nrc(f, ecu, 0x36, 0x73, rng.delay_us(20.0, 50.0)); // wrongBlockSequence
+        }
+
+        // Normal (or retry) transfer
+        push_multi(f, tester, ecu, &payload,
+            rng.delay_us(15.0, 30.0), rng.delay_us(3.0, 8.0), rng.delay_us(3.0, 8.0));
+
+        // Occasionally a pending before the positive ack
+        if rng.chance(0.05) {
+            push_nrc(f, ecu, 0x36, 0x78, rng.delay_us(100.0, 200.0));
+        }
+        push_sf(f, ecu, &[0x76, ctr], rng.delay_us(10.0, 25.0));
+    }
+}
+
+fn gen_dtc_sequence(f: &mut Vec<TimedFrame>, tester: u32, ecu: u32, rng: &mut Rng) {
+    // Read DTC count
+    let n = rng.range_u8(3, 7);
+    push_sf(f, tester, &[0x19, 0x01, 0xFF], rng.delay_us(30.0, 60.0));
+    push_sf(f, ecu, &[0x59, 0x01, 0xFF, 0x01, 0x00, n], rng.delay_us(15.0, 40.0));
+
+    // Read DTCs by status mask (multi-frame when > 1 DTC)
+    push_sf(f, tester, &[0x19, 0x02, 0xFF], rng.delay_us(30.0, 60.0));
+    let mut resp = vec![0x59u8, 0x02, 0xFF];
+    for _ in 0..n {
+        resp.push(rng.next() as u8); // DTC high
+        resp.push(rng.next() as u8); // DTC low
+        resp.push(0x00);              // failure type
+        resp.push(0x08 | (rng.next() as u8 & 0x2C)); // status
+    }
+    if resp.len() <= 7 {
+        push_sf(f, ecu, &resp, rng.delay_us(20.0, 50.0));
+    } else {
+        push_multi(f, ecu, tester, &resp,
+            rng.delay_us(20.0, 50.0), rng.delay_us(5.0, 15.0), rng.delay_us(5.0, 15.0));
+    }
+
+    // Clear all DTCs (group 0xFFFFFF)
+    push_sf(f, tester, &[0x14, 0xFF, 0xFF, 0xFF], rng.delay_us(30.0, 60.0));
+    push_nrc(f, ecu, 0x14, 0x78, rng.delay_us(150.0, 300.0)); // pending
+    push_sf(f, ecu, &[0x54], rng.delay_us(100.0, 250.0));
+
+    // Verify cleared
+    push_sf(f, tester, &[0x19, 0x01, 0xFF], rng.delay_us(30.0, 60.0));
+    push_sf(f, ecu, &[0x59, 0x01, 0xFF, 0x01, 0x00, 0x00], rng.delay_us(15.0, 40.0));
+}
+
+// ── Full UDS session ──────────────────────────────────────────────────────
+
+fn gen_uds_session(
+    tester: u32, ecu: u32,
+    num_blocks: usize, errors: bool, rng: &mut Rng,
+) -> Vec<TimedFrame> {
+    let mut f: Vec<TimedFrame> = Vec::with_capacity(num_blocks * 40 + 200);
+
+    // Phase 1: Extended diagnostic session
+    gen_session_control(&mut f, tester, ecu, 0x03, errors, rng);
+
+    // Phase 2: Read ECU identification
+    gen_read_identification(&mut f, tester, ecu, rng);
+
+    // Phase 3: Programming session
+    gen_session_control(&mut f, tester, ecu, 0x02, errors, rng);
+
+    // Phase 4: Security access (seed & key)
+    gen_security_access(&mut f, tester, ecu, errors, rng);
+
+    // Phase 5: Disable normal communication
+    push_sf(&mut f, tester, &[0x28, 0x03, 0x01], rng.delay_us(20.0, 40.0));
+    push_sf(&mut f, ecu, &[0x68, 0x03], rng.delay_us(10.0, 25.0));
+
+    // Phase 6: Disable DTC setting
+    push_sf(&mut f, tester, &[0x85, 0x02], rng.delay_us(20.0, 40.0));
+    push_sf(&mut f, ecu, &[0xC5, 0x02], rng.delay_us(10.0, 25.0));
+
+    // Phase 7: Check programming preconditions
+    gen_check_preconditions(&mut f, tester, ecu, errors, rng);
+
+    // Phase 8: Erase memory
+    gen_erase_memory(&mut f, tester, ecu, rng);
+
+    // Phase 9: Request download
+    gen_request_download(&mut f, tester, ecu, rng);
+
+    // Phase 10: Transfer data blocks
+    gen_transfer_data(&mut f, tester, ecu, num_blocks, errors, rng);
+
+    // Phase 11: Request transfer exit
+    push_sf(&mut f, tester, &[0x37], rng.delay_us(20.0, 40.0));
+    push_sf(&mut f, ecu, &[0x77], rng.delay_us(30.0, 80.0));
+
+    // Phase 12: Check programming dependencies
+    push_sf(&mut f, tester, &[0x31, 0x01, 0xFF, 0x02], rng.delay_us(30.0, 60.0));
+    push_nrc(&mut f, ecu, 0x31, 0x78, rng.delay_us(200.0, 400.0));
+    push_sf(&mut f, ecu, &[0x71, 0x01, 0xFF, 0x02, 0x00], rng.delay_us(100.0, 300.0));
+
+    // Phase 13–15: Read DTCs → clear → verify
+    gen_dtc_sequence(&mut f, tester, ecu, rng);
+
+    // Phase 16: ECU hard reset
+    push_sf(&mut f, tester, &[0x11, 0x01], rng.delay_us(30.0, 60.0));
+    push_sf(&mut f, ecu, &[0x51, 0x01], rng.delay_us(20.0, 50.0));
+
+    f
+}
+
+// ── OBD-II inter-session traffic ──────────────────────────────────────────
+
+fn gen_obd_polling(ecu: u32, cycles: usize, rng: &mut Rng) -> Vec<TimedFrame> {
+    let mut f = Vec::with_capacity(cycles * 10);
+    let obd_rx: u32 = 0x7DF; // functional addressing
+
+    let mut coolant: f64 = 85.0;
+    let mut rpm: f64 = 800.0;
+    let mut speed: f64 = 0.0;
+    let mut throttle: f64 = 15.0;
+
+    for _ in 0..cycles {
+        // Drift simulated vehicle state
+        coolant = (coolant + rng.uniform(-1.0, 1.0)).clamp(70.0, 105.0);
+        rpm = (rpm + rng.uniform(-50.0, 50.0)).clamp(650.0, 1200.0);
+        speed = (speed + rng.uniform(-1.0, 1.0)).clamp(0.0, 20.0);
+        throttle = (throttle + rng.uniform(-2.0, 2.0)).clamp(12.0, 25.0);
+
+        // Engine RPM (PID 0x0C)
+        if rng.chance(0.7) {
+            f.push(TimedFrame {
+                can_id: obd_rx,
+                data: [0x02, 0x01, 0x0C, 0, 0, 0, 0, 0],
+                pre_delay_us: rng.delay_us(15.0, 35.0),
+            });
+            let r = (rpm * 4.0) as u16;
+            f.push(TimedFrame {
+                can_id: ecu,
+                data: [0x04, 0x41, 0x0C, (r >> 8) as u8, r as u8, 0, 0, 0],
+                pre_delay_us: rng.delay_us(5.0, 25.0),
+            });
+        }
+        // Coolant temp (PID 0x05)
+        if rng.chance(0.6) {
+            f.push(TimedFrame {
+                can_id: obd_rx,
+                data: [0x02, 0x01, 0x05, 0, 0, 0, 0, 0],
+                pre_delay_us: rng.delay_us(15.0, 35.0),
+            });
+            f.push(TimedFrame {
+                can_id: ecu,
+                data: [0x03, 0x41, 0x05, (coolant as i32 + 40) as u8, 0, 0, 0, 0],
+                pre_delay_us: rng.delay_us(5.0, 25.0),
+            });
+        }
+        // Vehicle speed (PID 0x0D)
+        if rng.chance(0.5) {
+            f.push(TimedFrame {
+                can_id: obd_rx,
+                data: [0x02, 0x01, 0x0D, 0, 0, 0, 0, 0],
+                pre_delay_us: rng.delay_us(15.0, 35.0),
+            });
+            f.push(TimedFrame {
+                can_id: ecu,
+                data: [0x03, 0x41, 0x0D, speed as u8, 0, 0, 0, 0],
+                pre_delay_us: rng.delay_us(5.0, 25.0),
+            });
+        }
+        // Throttle (PID 0x11)
+        if rng.chance(0.5) {
+            f.push(TimedFrame {
+                can_id: obd_rx,
+                data: [0x02, 0x01, 0x11, 0, 0, 0, 0, 0],
+                pre_delay_us: rng.delay_us(15.0, 35.0),
+            });
+            f.push(TimedFrame {
+                can_id: ecu,
+                data: [0x03, 0x41, 0x11, (throttle * 255.0 / 100.0) as u8, 0, 0, 0, 0],
+                pre_delay_us: rng.delay_us(5.0, 25.0),
+            });
+        }
+
+        // Inter-cycle delay (~5–10 Hz scan rate)
+        f.push(TimedFrame { can_id: 0, data: [0; 8], pre_delay_us: rng.delay_us(80.0, 150.0) });
+    }
+    f
+}
+
+// ── Frame playback ────────────────────────────────────────────────────────
+
+fn play_timed_frames(fd: i32, frames: &[TimedFrame], speed: f64) -> (u64, u64) {
+    let mut sent: u64 = 0;
+    let mut errs: u64 = 0;
+    let mut next = Instant::now();
+
+    for tf in frames {
+        let us = (tf.pre_delay_us as f64 / speed) as u64;
+        next += Duration::from_micros(us);
+        wait_until(next);
+
+        if tf.can_id == 0 {
+            continue; // delay-only marker
+        }
+
+        let frame = CanFrame {
+            can_id: tf.can_id,
+            can_dlc: 8,
+            __pad: 0,
+            __res0: 0,
+            __res1: 0,
+            data: tf.data,
+        };
+        match send_frame(fd, &frame) {
+            Ok(()) => sent += 1,
+            Err(e) => {
+                errs += 1;
+                if errs <= 3 {
+                    eprintln!("warning: write failed: {}", e);
+                }
+            }
+        }
+    }
+    (sent, errs)
+}
+
+// ── UDS Flash runner ──────────────────────────────────────────────────────
+
+fn run_uds_flash(fd: i32, cli: &Cli) {
+    let tester = cli.tester_id;
+    let ecu = cli.ecu_id;
+    let speed = cli.speed;
+    let errors = !cli.no_errors;
+    let unlimited = cli.count == 0;
+    let mut rng = Rng::new(cli.seed);
+
+    if !cli.quiet {
+        let blocks_str = if cli.transfer_blocks == 0 {
+            "random".to_string()
+        } else {
+            cli.transfer_blocks.to_string()
+        };
+        eprintln!(
+            "mcangen: UDS flash — iface={} tester=0x{:03X} ecu=0x{:03X} speed={:.1}x blocks={} errors={} obd={}",
+            cli.interface, tester, ecu, speed, blocks_str,
+            if errors { "on" } else { "off" },
+            if cli.no_obd { "off" } else { "on" },
+        );
+    }
+
+    let t_start = Instant::now();
+    let mut sessions: u64 = 0;
+    let mut total_sent: u64 = 0;
+    let mut total_errs: u64 = 0;
+
+    loop {
+        if !unlimited && sessions >= cli.count {
+            break;
+        }
+        sessions += 1;
+
+        let num_blocks = if cli.transfer_blocks == 0 {
+            rng.range_u32(50, 150) as usize
+        } else {
+            cli.transfer_blocks as usize
+        };
+
+        let uds_frames = gen_uds_session(tester, ecu, num_blocks, errors, &mut rng);
+        let s_start = Instant::now();
+        let (sent, errs) = play_timed_frames(fd, &uds_frames, speed);
+        total_sent += sent;
+        total_errs += errs;
+
+        if !cli.quiet {
+            eprintln!(
+                "mcangen: session #{} — {} blocks, {} frames in {:.1}s",
+                sessions, num_blocks, sent, s_start.elapsed().as_secs_f64(),
+            );
+        }
+
+        // OBD-II polling between sessions
+        if !cli.no_obd && (unlimited || sessions < cli.count) {
+            let obd_cycles = rng.range_u32(15, 30) as usize;
+            let obd_frames = gen_obd_polling(ecu, obd_cycles, &mut rng);
+            let (s, e) = play_timed_frames(fd, &obd_frames, speed);
+            total_sent += s;
+            total_errs += e;
+
+            let pause = Duration::from_secs_f64(rng.uniform(1.0, 2.0) / speed);
+            std::thread::sleep(pause);
+        }
+    }
+
+    if !cli.quiet {
+        let secs = t_start.elapsed().as_secs_f64();
+        eprintln!(
+            "mcangen: done — {} sessions, {} frames in {:.1}s ({} errors)",
+            sessions, total_sent, secs, total_errs,
+        );
     }
 }
 
@@ -338,6 +891,16 @@ fn main() {
             eprintln!("error: --rate and --burst are mutually exclusive; use --burst-high-rate and --burst-low-rate");
             std::process::exit(1);
         }
+    }
+
+    if cli.uds_flash && cli.burst {
+        eprintln!("error: --uds-flash and --burst are mutually exclusive");
+        std::process::exit(1);
+    }
+
+    if cli.uds_flash && cli.speed <= 0.0 {
+        eprintln!("error: --speed must be positive");
+        std::process::exit(1);
     }
 
     // Quality-test protocol requires exactly 8 data bytes
@@ -377,6 +940,12 @@ fn main() {
         eprintln!("hint: make sure the interface exists (ip link show) and you have CAP_NET_RAW");
         std::process::exit(1);
     });
+
+    if cli.uds_flash {
+        run_uds_flash(fd, &cli);
+        unsafe { libc::close(fd); }
+        return;
+    }
 
     let interval = if max_rate {
         Duration::ZERO
