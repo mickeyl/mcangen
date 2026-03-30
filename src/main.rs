@@ -379,7 +379,11 @@ fn push_sf(frames: &mut Vec<TimedFrame>, can_id: u32, payload: &[u8], delay_us: 
     let mut data = [ISOTP_PAD; 8];
     data[0] = payload.len() as u8;
     data[1..1 + payload.len()].copy_from_slice(payload);
-    frames.push(TimedFrame { can_id, data, pre_delay_us: delay_us });
+    frames.push(TimedFrame {
+        can_id,
+        data,
+        pre_delay_us: delay_us,
+    });
 }
 
 fn push_nrc(frames: &mut Vec<TimedFrame>, ecu: u32, sid: u8, nrc: u8, delay_us: u64) {
@@ -403,14 +407,22 @@ fn push_multi(
     ff[1] = (total & 0xFF) as u8;
     let n = total.min(6);
     ff[2..2 + n].copy_from_slice(&payload[..n]);
-    frames.push(TimedFrame { can_id: sender, data: ff, pre_delay_us: ff_delay_us });
+    frames.push(TimedFrame {
+        can_id: sender,
+        data: ff,
+        pre_delay_us: ff_delay_us,
+    });
 
     // Flow Control
     let mut fc = [ISOTP_PAD; 8];
     fc[0] = 0x30;
     fc[1] = 0x00; // block_size = unlimited
     fc[2] = 0x0A; // st_min = 10 ms
-    frames.push(TimedFrame { can_id: responder, data: fc, pre_delay_us: fc_delay_us });
+    frames.push(TimedFrame {
+        can_id: responder,
+        data: fc,
+        pre_delay_us: fc_delay_us,
+    });
 
     // Consecutive Frames
     let mut off = 6;
@@ -420,7 +432,11 @@ fn push_multi(
         cf[0] = 0x20 | (seq & 0x0F);
         let end = (off + 7).min(total);
         cf[1..1 + end - off].copy_from_slice(&payload[off..end]);
-        frames.push(TimedFrame { can_id: sender, data: cf, pre_delay_us: cf_delay_us });
+        frames.push(TimedFrame {
+            can_id: sender,
+            data: cf,
+            pre_delay_us: cf_delay_us,
+        });
         off += 7;
         seq = (seq + 1) & 0x0F;
     }
@@ -429,34 +445,45 @@ fn push_multi(
 // ── UDS session phases ────────────────────────────────────────────────────
 
 fn gen_session_control(
-    f: &mut Vec<TimedFrame>, tester: u32, ecu: u32,
-    session: u8, errors: bool, rng: &mut Rng,
+    f: &mut Vec<TimedFrame>,
+    tester: u32,
+    ecu: u32,
+    session: u8,
+    errors: bool,
+    rng: &mut Rng,
 ) {
     let req = [0x10, session];
     if errors && rng.chance(0.03) {
         push_sf(f, tester, &req, rng.delay_us(20.0, 50.0));
         push_nrc(f, ecu, 0x10, 0x21, rng.delay_us(15.0, 30.0)); // busy
-        push_sf(f, tester, &req, rng.delay_us(100.0, 200.0));     // retry
+        push_sf(f, tester, &req, rng.delay_us(100.0, 200.0)); // retry
     } else {
         push_sf(f, tester, &req, rng.delay_us(20.0, 50.0));
     }
     // P2=25ms, P2*=5000ms
-    push_sf(f, ecu, &[0x50, session, 0x00, 0x19, 0x01, 0xF4], rng.delay_us(15.0, 40.0));
+    push_sf(
+        f,
+        ecu,
+        &[0x50, session, 0x00, 0x19, 0x01, 0xF4],
+        rng.delay_us(15.0, 40.0),
+    );
 }
 
-fn gen_read_identification(
-    f: &mut Vec<TimedFrame>, tester: u32, ecu: u32, rng: &mut Rng,
-) {
+fn gen_read_identification(f: &mut Vec<TimedFrame>, tester: u32, ecu: u32, rng: &mut Rng) {
     const IDS: [(u16, &[u8]); 5] = [
-        (0xF190, b"WVWZZZ3CZWE123456"),  // VIN
-        (0xF18C, b"ECU12345678"),         // Serial Number
-        (0xF195, b"SW_V02.15.003"),       // Software Version
-        (0xF193, b"HW_REV_C"),            // Hardware Version
-        (0xF187, b"PART_1K0907115B"),     // Part Number
+        (0xF190, b"WVWZZZ3CZWE123456"), // VIN
+        (0xF18C, b"ECU12345678"),       // Serial Number
+        (0xF195, b"SW_V02.15.003"),     // Software Version
+        (0xF193, b"HW_REV_C"),          // Hardware Version
+        (0xF187, b"PART_1K0907115B"),   // Part Number
     ];
     for &(did, val) in &IDS {
-        push_sf(f, tester,
-            &[0x22, (did >> 8) as u8, did as u8], rng.delay_us(30.0, 80.0));
+        push_sf(
+            f,
+            tester,
+            &[0x22, (did >> 8) as u8, did as u8],
+            rng.delay_us(30.0, 80.0),
+        );
 
         let mut resp = Vec::with_capacity(3 + val.len());
         resp.extend_from_slice(&[0x62, (did >> 8) as u8, did as u8]);
@@ -465,86 +492,151 @@ fn gen_read_identification(
         if resp.len() <= 7 {
             push_sf(f, ecu, &resp, rng.delay_us(10.0, 30.0));
         } else {
-            push_multi(f, ecu, tester, &resp,
-                rng.delay_us(10.0, 30.0), rng.delay_us(5.0, 15.0), rng.delay_us(5.0, 15.0));
+            push_multi(
+                f,
+                ecu,
+                tester,
+                &resp,
+                rng.delay_us(10.0, 30.0),
+                rng.delay_us(5.0, 15.0),
+                rng.delay_us(5.0, 15.0),
+            );
         }
     }
 }
 
 fn gen_security_access(
-    f: &mut Vec<TimedFrame>, tester: u32, ecu: u32,
-    errors: bool, rng: &mut Rng,
+    f: &mut Vec<TimedFrame>,
+    tester: u32,
+    ecu: u32,
+    errors: bool,
+    rng: &mut Rng,
 ) {
     let lvl: u8 = 0x11; // programming security level
     if errors && rng.chance(0.15) {
         // Failed first attempt
         push_sf(f, tester, &[0x27, lvl], rng.delay_us(20.0, 40.0));
         let s = rng.next_u32().to_be_bytes();
-        push_sf(f, ecu, &[0x67, lvl, s[0], s[1], s[2], s[3]], rng.delay_us(100.0, 200.0));
+        push_sf(
+            f,
+            ecu,
+            &[0x67, lvl, s[0], s[1], s[2], s[3]],
+            rng.delay_us(100.0, 200.0),
+        );
         let k = rng.next_u32().to_be_bytes(); // wrong key
-        push_sf(f, tester, &[0x27, lvl + 1, k[0], k[1], k[2], k[3]], rng.delay_us(50.0, 100.0));
+        push_sf(
+            f,
+            tester,
+            &[0x27, lvl + 1, k[0], k[1], k[2], k[3]],
+            rng.delay_us(50.0, 100.0),
+        );
         push_nrc(f, ecu, 0x27, 0x35, rng.delay_us(30.0, 80.0)); // invalidKey
-        f.push(TimedFrame { can_id: 0, data: [0; 8], pre_delay_us: rng.delay_us(500.0, 1000.0) });
+        f.push(TimedFrame {
+            can_id: 0,
+            data: [0; 8],
+            pre_delay_us: rng.delay_us(500.0, 1000.0),
+        });
     }
     // Successful attempt
     push_sf(f, tester, &[0x27, lvl], rng.delay_us(20.0, 40.0));
     let s = rng.next_u32().to_be_bytes();
-    push_sf(f, ecu, &[0x67, lvl, s[0], s[1], s[2], s[3]], rng.delay_us(100.0, 250.0));
+    push_sf(
+        f,
+        ecu,
+        &[0x67, lvl, s[0], s[1], s[2], s[3]],
+        rng.delay_us(100.0, 250.0),
+    );
     let key = [s[0] ^ 0xCA, s[1] ^ 0xCA, s[2] ^ 0xCA, s[3] ^ 0xCA];
-    push_sf(f, tester, &[0x27, lvl + 1, key[0], key[1], key[2], key[3]], rng.delay_us(50.0, 100.0));
+    push_sf(
+        f,
+        tester,
+        &[0x27, lvl + 1, key[0], key[1], key[2], key[3]],
+        rng.delay_us(50.0, 100.0),
+    );
     push_sf(f, ecu, &[0x67, lvl + 1], rng.delay_us(80.0, 200.0));
 }
 
 fn gen_check_preconditions(
-    f: &mut Vec<TimedFrame>, tester: u32, ecu: u32,
-    errors: bool, rng: &mut Rng,
+    f: &mut Vec<TimedFrame>,
+    tester: u32,
+    ecu: u32,
+    errors: bool,
+    rng: &mut Rng,
 ) {
     let req = [0x31, 0x01, 0xFF, 0x00]; // routine 0xFF00
     if errors && rng.chance(0.02) {
         push_sf(f, tester, &req, rng.delay_us(30.0, 60.0));
         push_nrc(f, ecu, 0x31, 0x22, rng.delay_us(20.0, 50.0)); // conditionsNotCorrect
-        f.push(TimedFrame { can_id: 0, data: [0; 8], pre_delay_us: rng.delay_us(300.0, 600.0) });
+        f.push(TimedFrame {
+            can_id: 0,
+            data: [0; 8],
+            pre_delay_us: rng.delay_us(300.0, 600.0),
+        });
         push_sf(f, tester, &req, rng.delay_us(30.0, 60.0)); // retry
     } else {
         push_sf(f, tester, &req, rng.delay_us(30.0, 60.0));
     }
-    push_sf(f, ecu, &[0x71, 0x01, 0xFF, 0x00, 0x00], rng.delay_us(50.0, 150.0));
+    push_sf(
+        f,
+        ecu,
+        &[0x71, 0x01, 0xFF, 0x00, 0x00],
+        rng.delay_us(50.0, 150.0),
+    );
 }
 
 fn gen_erase_memory(f: &mut Vec<TimedFrame>, tester: u32, ecu: u32, rng: &mut Rng) {
     // Routine 0xFF01, addr 0x00080000, size 0x00040000
     let payload: [u8; 13] = [
-        0x31, 0x01, 0xFF, 0x01, 0x44,
-        0x00, 0x08, 0x00, 0x00,
-        0x00, 0x04, 0x00, 0x00,
+        0x31, 0x01, 0xFF, 0x01, 0x44, 0x00, 0x08, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00,
     ];
-    push_multi(f, tester, ecu, &payload,
-        rng.delay_us(20.0, 40.0), rng.delay_us(5.0, 15.0), rng.delay_us(5.0, 15.0));
+    push_multi(
+        f,
+        tester,
+        ecu,
+        &payload,
+        rng.delay_us(20.0, 40.0),
+        rng.delay_us(5.0, 15.0),
+        rng.delay_us(5.0, 15.0),
+    );
 
     // Pending responses while flash is being erased
     let num_pending = rng.range_u32(3, 8);
     for _ in 0..num_pending {
         push_nrc(f, ecu, 0x31, 0x78, rng.delay_us(400.0, 700.0)); // responsePending
     }
-    push_sf(f, ecu, &[0x71, 0x01, 0xFF, 0x01, 0x00], rng.delay_us(300.0, 600.0));
+    push_sf(
+        f,
+        ecu,
+        &[0x71, 0x01, 0xFF, 0x01, 0x00],
+        rng.delay_us(300.0, 600.0),
+    );
 }
 
 fn gen_request_download(f: &mut Vec<TimedFrame>, tester: u32, ecu: u32, rng: &mut Rng) {
     // No compression/encryption, 4-byte addr + 4-byte size
     let payload: [u8; 11] = [
-        0x34, 0x00, 0x44,
-        0x00, 0x08, 0x00, 0x00,
-        0x00, 0x04, 0x00, 0x00,
+        0x34, 0x00, 0x44, 0x00, 0x08, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00,
     ];
-    push_multi(f, tester, ecu, &payload,
-        rng.delay_us(20.0, 40.0), rng.delay_us(5.0, 15.0), rng.delay_us(5.0, 15.0));
+    push_multi(
+        f,
+        tester,
+        ecu,
+        &payload,
+        rng.delay_us(20.0, 40.0),
+        rng.delay_us(5.0, 15.0),
+        rng.delay_us(5.0, 15.0),
+    );
     // max block length 258
     push_sf(f, ecu, &[0x74, 0x20, 0x01, 0x02], rng.delay_us(30.0, 80.0));
 }
 
 fn gen_transfer_data(
-    f: &mut Vec<TimedFrame>, tester: u32, ecu: u32,
-    num_blocks: usize, errors: bool, rng: &mut Rng,
+    f: &mut Vec<TimedFrame>,
+    tester: u32,
+    ecu: u32,
+    num_blocks: usize,
+    errors: bool,
+    rng: &mut Rng,
 ) {
     let mut ctr: u8 = 0;
     let mut error_done = false;
@@ -565,14 +657,28 @@ fn gen_transfer_data(
             let wrong = ctr.wrapping_add(rng.range_u8(1, 5));
             let mut bad = payload.clone();
             bad[1] = wrong;
-            push_multi(f, tester, ecu, &bad,
-                rng.delay_us(15.0, 30.0), rng.delay_us(3.0, 8.0), rng.delay_us(3.0, 8.0));
+            push_multi(
+                f,
+                tester,
+                ecu,
+                &bad,
+                rng.delay_us(15.0, 30.0),
+                rng.delay_us(3.0, 8.0),
+                rng.delay_us(3.0, 8.0),
+            );
             push_nrc(f, ecu, 0x36, 0x73, rng.delay_us(20.0, 50.0)); // wrongBlockSequence
         }
 
         // Normal (or retry) transfer
-        push_multi(f, tester, ecu, &payload,
-            rng.delay_us(15.0, 30.0), rng.delay_us(3.0, 8.0), rng.delay_us(3.0, 8.0));
+        push_multi(
+            f,
+            tester,
+            ecu,
+            &payload,
+            rng.delay_us(15.0, 30.0),
+            rng.delay_us(3.0, 8.0),
+            rng.delay_us(3.0, 8.0),
+        );
 
         // Occasionally a pending before the positive ack
         if rng.chance(0.05) {
@@ -586,7 +692,12 @@ fn gen_dtc_sequence(f: &mut Vec<TimedFrame>, tester: u32, ecu: u32, rng: &mut Rn
     // Read DTC count
     let n = rng.range_u8(3, 7);
     push_sf(f, tester, &[0x19, 0x01, 0xFF], rng.delay_us(30.0, 60.0));
-    push_sf(f, ecu, &[0x59, 0x01, 0xFF, 0x01, 0x00, n], rng.delay_us(15.0, 40.0));
+    push_sf(
+        f,
+        ecu,
+        &[0x59, 0x01, 0xFF, 0x01, 0x00, n],
+        rng.delay_us(15.0, 40.0),
+    );
 
     // Read DTCs by status mask (multi-frame when > 1 DTC)
     push_sf(f, tester, &[0x19, 0x02, 0xFF], rng.delay_us(30.0, 60.0));
@@ -594,31 +705,51 @@ fn gen_dtc_sequence(f: &mut Vec<TimedFrame>, tester: u32, ecu: u32, rng: &mut Rn
     for _ in 0..n {
         resp.push(rng.next() as u8); // DTC high
         resp.push(rng.next() as u8); // DTC low
-        resp.push(0x00);              // failure type
+        resp.push(0x00); // failure type
         resp.push(0x08 | (rng.next() as u8 & 0x2C)); // status
     }
     if resp.len() <= 7 {
         push_sf(f, ecu, &resp, rng.delay_us(20.0, 50.0));
     } else {
-        push_multi(f, ecu, tester, &resp,
-            rng.delay_us(20.0, 50.0), rng.delay_us(5.0, 15.0), rng.delay_us(5.0, 15.0));
+        push_multi(
+            f,
+            ecu,
+            tester,
+            &resp,
+            rng.delay_us(20.0, 50.0),
+            rng.delay_us(5.0, 15.0),
+            rng.delay_us(5.0, 15.0),
+        );
     }
 
     // Clear all DTCs (group 0xFFFFFF)
-    push_sf(f, tester, &[0x14, 0xFF, 0xFF, 0xFF], rng.delay_us(30.0, 60.0));
+    push_sf(
+        f,
+        tester,
+        &[0x14, 0xFF, 0xFF, 0xFF],
+        rng.delay_us(30.0, 60.0),
+    );
     push_nrc(f, ecu, 0x14, 0x78, rng.delay_us(150.0, 300.0)); // pending
     push_sf(f, ecu, &[0x54], rng.delay_us(100.0, 250.0));
 
     // Verify cleared
     push_sf(f, tester, &[0x19, 0x01, 0xFF], rng.delay_us(30.0, 60.0));
-    push_sf(f, ecu, &[0x59, 0x01, 0xFF, 0x01, 0x00, 0x00], rng.delay_us(15.0, 40.0));
+    push_sf(
+        f,
+        ecu,
+        &[0x59, 0x01, 0xFF, 0x01, 0x00, 0x00],
+        rng.delay_us(15.0, 40.0),
+    );
 }
 
 // ── Full UDS session ──────────────────────────────────────────────────────
 
 fn gen_uds_session(
-    tester: u32, ecu: u32,
-    num_blocks: usize, errors: bool, rng: &mut Rng,
+    tester: u32,
+    ecu: u32,
+    num_blocks: usize,
+    errors: bool,
+    rng: &mut Rng,
 ) -> Vec<TimedFrame> {
     let mut f: Vec<TimedFrame> = Vec::with_capacity(num_blocks * 40 + 200);
 
@@ -635,7 +766,12 @@ fn gen_uds_session(
     gen_security_access(&mut f, tester, ecu, errors, rng);
 
     // Phase 5: Disable normal communication
-    push_sf(&mut f, tester, &[0x28, 0x03, 0x01], rng.delay_us(20.0, 40.0));
+    push_sf(
+        &mut f,
+        tester,
+        &[0x28, 0x03, 0x01],
+        rng.delay_us(20.0, 40.0),
+    );
     push_sf(&mut f, ecu, &[0x68, 0x03], rng.delay_us(10.0, 25.0));
 
     // Phase 6: Disable DTC setting
@@ -659,9 +795,19 @@ fn gen_uds_session(
     push_sf(&mut f, ecu, &[0x77], rng.delay_us(30.0, 80.0));
 
     // Phase 12: Check programming dependencies
-    push_sf(&mut f, tester, &[0x31, 0x01, 0xFF, 0x02], rng.delay_us(30.0, 60.0));
+    push_sf(
+        &mut f,
+        tester,
+        &[0x31, 0x01, 0xFF, 0x02],
+        rng.delay_us(30.0, 60.0),
+    );
     push_nrc(&mut f, ecu, 0x31, 0x78, rng.delay_us(200.0, 400.0));
-    push_sf(&mut f, ecu, &[0x71, 0x01, 0xFF, 0x02, 0x00], rng.delay_us(100.0, 300.0));
+    push_sf(
+        &mut f,
+        ecu,
+        &[0x71, 0x01, 0xFF, 0x02, 0x00],
+        rng.delay_us(100.0, 300.0),
+    );
 
     // Phase 13–15: Read DTCs → clear → verify
     gen_dtc_sequence(&mut f, tester, ecu, rng);
@@ -740,13 +886,26 @@ fn gen_obd_polling(ecu: u32, cycles: usize, rng: &mut Rng) -> Vec<TimedFrame> {
             });
             f.push(TimedFrame {
                 can_id: ecu,
-                data: [0x03, 0x41, 0x11, (throttle * 255.0 / 100.0) as u8, 0, 0, 0, 0],
+                data: [
+                    0x03,
+                    0x41,
+                    0x11,
+                    (throttle * 255.0 / 100.0) as u8,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
                 pre_delay_us: rng.delay_us(5.0, 25.0),
             });
         }
 
         // Inter-cycle delay (~5–10 Hz scan rate)
-        f.push(TimedFrame { can_id: 0, data: [0; 8], pre_delay_us: rng.delay_us(80.0, 150.0) });
+        f.push(TimedFrame {
+            can_id: 0,
+            data: [0; 8],
+            pre_delay_us: rng.delay_us(80.0, 150.0),
+        });
     }
     f
 }
@@ -838,7 +997,10 @@ fn run_uds_flash(fd: i32, cli: &Cli) {
         if !cli.quiet {
             eprintln!(
                 "mcangen: session #{} — {} blocks, {} frames in {:.1}s",
-                sessions, num_blocks, sent, s_start.elapsed().as_secs_f64(),
+                sessions,
+                num_blocks,
+                sent,
+                s_start.elapsed().as_secs_f64(),
             );
         }
 
@@ -943,7 +1105,9 @@ fn main() {
 
     if cli.uds_flash {
         run_uds_flash(fd, &cli);
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         return;
     }
 
