@@ -12,7 +12,7 @@ SRC       := $(shell find src -name '*.rs') Cargo.toml Cargo.lock
 
 VERSION   := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 
-.PHONY: all build run blast test clean install uninstall fmt check clippy vcan man release publish help
+.PHONY: all build run blast uds-flash test clean install uninstall fmt check clippy vcan man release publish help
 
 all: help
 
@@ -27,6 +27,10 @@ run: $(BIN)
 # Send as fast as possible — good for throughput benchmarks
 blast: $(BIN)
 	./$(BIN) $(IFACE) -r 0 -n 1000000 -p 100000 $(EXTRA)
+
+# UDS flash simulation: single session by default
+uds-flash: $(BIN)
+	./$(BIN) $(IFACE) --uds-flash -n 1 $(EXTRA)
 
 # Quick smoke test: 1000 frames at 2000 fps with progress
 test: $(BIN)
@@ -89,6 +93,7 @@ help:
 	@echo "  build      Build release binary (default)"
 	@echo "  run        Run with IFACE, COUNT, RATE, EXTRA"
 	@echo "  blast      1M frames as fast as possible"
+	@echo "  uds-flash  Run single UDS flash session"
 	@echo "  test       Quick smoke test (1000 frames @ 2000 fps)"
 	@echo "  vcan       Create vcan0 virtual interface (requires sudo)"
 	@echo "  man        View the man page"
