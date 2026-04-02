@@ -288,6 +288,13 @@ mcangen counts successful `write()` calls, which will always match
 `--count` exactly. The difference tells you how noisy or contested your
 bus is.
 
+## See Also
+
+- [mcandump](https://github.com/mickeyl/mcandump) — CAN bus logger
+  proxy (companion tool for capturing and forwarding traffic)
+- [CANcorder](https://apps.apple.com/app/cancorder/id6743640770) — CAN
+  bus logger and analyzer for macOS/iOS
+
 ## Man page
 
 ```bash

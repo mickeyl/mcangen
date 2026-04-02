@@ -12,7 +12,7 @@ SRC       := $(shell find src -name '*.rs') Cargo.toml Cargo.lock
 
 VERSION   := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 
-.PHONY: all build run blast uds-flash test clean install uninstall fmt check clippy vcan man release publish help
+.PHONY: all build run blast uds-flash test clean install uninstall fmt check clippy vcan vcanfd man release publish help
 
 all: help
 
@@ -40,6 +40,12 @@ test: $(BIN)
 vcan:
 	sudo modprobe vcan
 	sudo ip link add dev vcan0 type vcan 2>/dev/null || true
+	sudo ip link set up vcan0
+
+# Set up a virtual CAN-FD interface for testing
+vcanfd:
+	sudo modprobe vcan
+	sudo ip link add dev vcan0 type vcan mtu 72 2>/dev/null || true
 	sudo ip link set up vcan0
 
 fmt:
@@ -96,6 +102,7 @@ help:
 	@echo "  uds-flash  Run single UDS flash session"
 	@echo "  test       Quick smoke test (1000 frames @ 2000 fps)"
 	@echo "  vcan       Create vcan0 virtual interface (requires sudo)"
+	@echo "  vcanfd     Create vcan0 with CAN-FD MTU (requires sudo)"
 	@echo "  man        View the man page"
 	@echo "  install    Install binary and man page to PREFIX (default: ~/.local)"
 	@echo "  uninstall  Remove installed files"
