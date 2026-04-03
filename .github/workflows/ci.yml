@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: stable
 
 jobs:
   check:
@@ -14,11 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust stable
-        run: |
-          rustup update stable
-          rustup default stable
-          rustup component add clippy
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+        run: rustup update stable && rustup component add clippy
       - run: rustc --version
       - run: cargo check
       - run: cargo clippy -- -D warnings
