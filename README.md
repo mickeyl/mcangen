@@ -48,8 +48,9 @@ Typical use cases:
 
 ## Features
 
-- **Fast** — raw SocketCAN writes with zero-copy framing, release build
-  with LTO, single-threaded hot loop
+- **Fast** — `sendmmsg()` batching in max-rate mode for reduced syscall
+  overhead, `clock_nanosleep()` for precise rate control with minimal
+  CPU usage, CAN-FD capable socket, release build with LTO
 - **All frame types** — standard (11-bit) IDs, extended (29-bit) IDs, or a
   random mix of both
 - **Configurable DLC** — any range from 0 to 8 bytes
@@ -60,8 +61,8 @@ Typical use cases:
   DTC handling, and ECU reset — both tester and ECU sides on the bus
 - **Burst mode** — alternating high/low rate phases to emulate ECU
   reprogramming traffic patterns
-- **Precise rate control** — hybrid sleep/busy-spin for accurate FPS
-  targeting from 1 fps to line rate
+- **Precise rate control** — `clock_nanosleep` with a final busy-spin
+  for sub-microsecond accuracy from 1 fps to line rate
 - **Exact counts** — send a precise number of frames then stop
 - **Reproducible** — seed the PRNG for deterministic, repeatable runs
 - **Minimal dependencies** — just `clap`, `libc`, `nix`, and `fastrand`

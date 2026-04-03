@@ -11,6 +11,9 @@ const CAN_RAW: i32 = 1;
 // libc::Ioctl is c_ulong on glibc, c_int on musl — use the alias for portability.
 const SIOCGIFINDEX: libc::Ioctl = 0x8933 as libc::Ioctl;
 
+const SOL_CAN_RAW: libc::c_int = 101;
+const CAN_RAW_FD_FRAMES: libc::c_int = 5;
+
 const CAN_EFF_FLAG: u32 = 0x8000_0000;
 const CAN_SFF_MASK: u32 = 0x0000_07FF;
 const CAN_EFF_MASK: u32 = 0x1FFF_FFFF;
@@ -244,6 +247,16 @@ fn open_can_socket(ifname: &str) -> io::Result<i32> {
             return Err(e);
         }
 
+        // Enable CAN-FD reception/transmission (non-fatal if unsupported)
+        let enable: libc::c_int = 1;
+        libc::setsockopt(
+            fd,
+            SOL_CAN_RAW,
+            CAN_RAW_FD_FRAMES,
+            &enable as *const libc::c_int as *const libc::c_void,
+            mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+
         // Increase send buffer for burst performance
         let sndbuf: libc::c_int = 1 << 20; // 1 MiB
         libc::setsockopt(
@@ -255,6 +268,37 @@ fn open_can_socket(ifname: &str) -> io::Result<i32> {
         );
 
         Ok(fd)
+    }
+}
+
+const BATCH_SIZE: usize = 64;
+
+/// Send multiple CAN frames in a single syscall using sendmmsg.
+/// Returns the number of frames successfully sent.
+#[inline]
+fn send_frames_batch(fd: i32, frames: &[CanFrame]) -> io::Result<usize> {
+    let count = frames.len().min(BATCH_SIZE);
+    if count == 0 {
+        return Ok(0);
+    }
+
+    let mut iovecs: [libc::iovec; BATCH_SIZE] = unsafe { mem::zeroed() };
+    let mut msgvec: [libc::mmsghdr; BATCH_SIZE] = unsafe { mem::zeroed() };
+
+    for i in 0..count {
+        iovecs[i] = libc::iovec {
+            iov_base: &frames[i] as *const CanFrame as *mut libc::c_void,
+            iov_len: mem::size_of::<CanFrame>(),
+        };
+        msgvec[i].msg_hdr.msg_iov = &mut iovecs[i];
+        msgvec[i].msg_hdr.msg_iovlen = 1;
+    }
+
+    let ret = unsafe { libc::sendmmsg(fd, msgvec.as_mut_ptr(), count as u32, 0) };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ret as usize)
     }
 }
 
@@ -343,8 +387,9 @@ impl Rng {
 
 // ── Precise rate-limited sleep ─────────────────────────────────────────────
 
-/// Busy-spin until `target` time is reached. For intervals > 1ms, sleeps for
-/// most of the duration then busy-spins the remainder for precision.
+/// Sleep until `target` time using clock_nanosleep for precision, then
+/// busy-spin only the final ~100µs for sub-microsecond accuracy.
+/// Much lower CPU usage than the previous 2ms busy-spin approach.
 #[inline]
 fn wait_until(target: Instant) {
     let now = Instant::now();
@@ -352,9 +397,18 @@ fn wait_until(target: Instant) {
         return;
     }
     let remaining = target - now;
-    // For long waits, sleep most of it to avoid wasting CPU
-    if remaining > Duration::from_millis(2) {
-        std::thread::sleep(remaining - Duration::from_millis(1));
+    // Use clock_nanosleep for the bulk — it's more precise than thread::sleep
+    // because it goes through the high-resolution timer path in the kernel.
+    // Leave 100µs for the final spin to absorb scheduling jitter.
+    if remaining > Duration::from_micros(200) {
+        let sleep_dur = remaining - Duration::from_micros(100);
+        let ts = libc::timespec {
+            tv_sec: sleep_dur.as_secs() as libc::time_t,
+            tv_nsec: sleep_dur.subsec_nanos() as libc::c_long,
+        };
+        unsafe {
+            libc::clock_nanosleep(libc::CLOCK_MONOTONIC, 0, &ts, std::ptr::null_mut());
+        }
     }
     // Busy-spin the final stretch for accuracy
     while Instant::now() < target {
@@ -1172,137 +1226,243 @@ fn main() {
     let mut next_send = t_start;
     burst_phase_start = t_start;
 
-    loop {
-        if !unlimited && sent >= cli.count {
-            break;
-        }
+    // ── Max-rate path: use sendmmsg batching for throughput ───────────
+    if max_rate {
+        let mut batch: [CanFrame; BATCH_SIZE] = [frame; BATCH_SIZE];
 
-        // ── ID ──
-        let raw_id = match cli.id_mode {
-            IdMode::Random => rng.range_u32(id_min, id_max),
-            IdMode::Sequential => {
-                let id = seq_id;
-                seq_id = if seq_id >= id_max { id_min } else { seq_id + 1 };
-                id
-            }
-        };
-
-        // Decide if this frame is extended
-        let use_extended = match cli.id_kind {
-            IdKind::Standard => false,
-            IdKind::Extended => true,
-            IdKind::Mixed => rng.next() & 1 == 0,
-        };
-
-        frame.can_id = if use_extended {
-            let mut id = raw_id & CAN_EFF_MASK;
-            if cli.ext_id_above_sff && id <= CAN_SFF_MASK {
-                id = CAN_SFF_MASK + 1 + (id % (CAN_EFF_MASK - CAN_SFF_MASK));
-            }
-            id | CAN_EFF_FLAG
-        } else {
-            raw_id & CAN_SFF_MASK
-        };
-
-        // ── DLC ──
-        frame.can_dlc = rng.range_u8(dlc_min, dlc_max).min(CAN_MAX_DLC);
-
-        // ── Data ──
-        match cli.data_mode {
-            DataMode::Random => {
-                let r1 = rng.next();
-                frame.data[..8].copy_from_slice(&r1.to_ne_bytes());
-            }
-            DataMode::Zero => {
-                frame.data = [0u8; 8];
-            }
-            DataMode::Ones => {
-                frame.data = [0xFFu8; 8];
-            }
-            DataMode::Counter => {
-                frame.data = [counter; 8];
-                counter = counter.wrapping_add(1);
-            }
-            DataMode::Sequence => {
-                frame.data[..8].copy_from_slice(&seqnum.to_be_bytes());
-                seqnum = seqnum.wrapping_add(1);
-            }
-            DataMode::QualityTest => {
-                let elapsed_ms = t_start.elapsed().as_millis() as u16;
-                frame.data[0] = 0xCA;
-                frame.data[1] = 0xFE;
-                frame.data[2..4].copy_from_slice(&qt_seqnum.to_be_bytes());
-                frame.data[4..6].copy_from_slice(&elapsed_ms.to_be_bytes());
-                frame.data[6] = cli.test_id;
-                frame.data[7] = frame.data[..7].iter().fold(0u8, |acc, &b| acc ^ b);
-                qt_seqnum = qt_seqnum.wrapping_add(1);
-            }
-        }
-
-        // ── Rate limiting ──
-        if cli.burst {
-            // Check for phase transition
-            let phase_dur = if burst_phase_high {
-                burst_high_dur
+        'max_rate: loop {
+            // Fill a batch of frames
+            let batch_count = if unlimited {
+                BATCH_SIZE
             } else {
-                burst_low_dur
+                BATCH_SIZE.min((cli.count - sent) as usize)
             };
-            if burst_phase_start.elapsed() >= phase_dur {
-                burst_phase_high = !burst_phase_high;
-                burst_phase_start = Instant::now();
-                next_send = burst_phase_start;
+            if batch_count == 0 {
+                break;
             }
 
-            let current_interval = if burst_phase_high {
-                burst_high_interval
+            for bf in batch.iter_mut().take(batch_count) {
+                let raw_id = match cli.id_mode {
+                    IdMode::Random => rng.range_u32(id_min, id_max),
+                    IdMode::Sequential => {
+                        let id = seq_id;
+                        seq_id = if seq_id >= id_max { id_min } else { seq_id + 1 };
+                        id
+                    }
+                };
+                let use_extended = match cli.id_kind {
+                    IdKind::Standard => false,
+                    IdKind::Extended => true,
+                    IdKind::Mixed => rng.next() & 1 == 0,
+                };
+                bf.can_id = if use_extended {
+                    let mut id = raw_id & CAN_EFF_MASK;
+                    if cli.ext_id_above_sff && id <= CAN_SFF_MASK {
+                        id = CAN_SFF_MASK + 1 + (id % (CAN_EFF_MASK - CAN_SFF_MASK));
+                    }
+                    id | CAN_EFF_FLAG
+                } else {
+                    raw_id & CAN_SFF_MASK
+                };
+                bf.can_dlc = rng.range_u8(dlc_min, dlc_max).min(CAN_MAX_DLC);
+                match cli.data_mode {
+                    DataMode::Random => {
+                        let r1 = rng.next();
+                        bf.data[..8].copy_from_slice(&r1.to_ne_bytes());
+                    }
+                    DataMode::Zero => bf.data = [0u8; 8],
+                    DataMode::Ones => bf.data = [0xFFu8; 8],
+                    DataMode::Counter => {
+                        bf.data = [counter; 8];
+                        counter = counter.wrapping_add(1);
+                    }
+                    DataMode::Sequence => {
+                        bf.data[..8].copy_from_slice(&seqnum.to_be_bytes());
+                        seqnum = seqnum.wrapping_add(1);
+                    }
+                    DataMode::QualityTest => {
+                        let elapsed_ms = t_start.elapsed().as_millis() as u16;
+                        bf.data[0] = 0xCA;
+                        bf.data[1] = 0xFE;
+                        bf.data[2..4].copy_from_slice(&qt_seqnum.to_be_bytes());
+                        bf.data[4..6].copy_from_slice(&elapsed_ms.to_be_bytes());
+                        bf.data[6] = cli.test_id;
+                        bf.data[7] = bf.data[..7].iter().fold(0u8, |acc, &b| acc ^ b);
+                        qt_seqnum = qt_seqnum.wrapping_add(1);
+                    }
+                }
+            }
+
+            // Send the batch
+            match send_frames_batch(fd, &batch[..batch_count]) {
+                Ok(n) => sent += n as u64,
+                Err(e) => {
+                    // Fallback: send individually on batch failure
+                    for f in &batch[..batch_count] {
+                        match send_frame(fd, f) {
+                            Ok(()) => sent += 1,
+                            Err(e) => {
+                                errors += 1;
+                                if e.raw_os_error() != Some(libc::ENOBUFS) && errors > 100 {
+                                    eprintln!("error: too many write errors, aborting");
+                                    break 'max_rate;
+                                }
+                            }
+                        }
+                    }
+                    if errors <= 5 {
+                        eprintln!("warning: sendmmsg failed, falling back: {}", e);
+                    }
+                }
+            }
+
+            if cli.progress > 0 && sent >= cli.progress && !cli.quiet {
+                let prev = sent - batch_count as u64;
+                if prev / cli.progress < sent / cli.progress {
+                    let elapsed = t_start.elapsed().as_secs_f64();
+                    eprintln!(
+                        "  sent {} frames in {:.2}s ({:.0} fps)",
+                        sent,
+                        elapsed,
+                        sent as f64 / elapsed,
+                    );
+                }
+            }
+        }
+    } else {
+        // ── Rate-limited / burst path: one frame at a time ───────────────
+        loop {
+            if !unlimited && sent >= cli.count {
+                break;
+            }
+
+            // ── ID ──
+            let raw_id = match cli.id_mode {
+                IdMode::Random => rng.range_u32(id_min, id_max),
+                IdMode::Sequential => {
+                    let id = seq_id;
+                    seq_id = if seq_id >= id_max { id_min } else { seq_id + 1 };
+                    id
+                }
+            };
+
+            // Decide if this frame is extended
+            let use_extended = match cli.id_kind {
+                IdKind::Standard => false,
+                IdKind::Extended => true,
+                IdKind::Mixed => rng.next() & 1 == 0,
+            };
+
+            frame.can_id = if use_extended {
+                let mut id = raw_id & CAN_EFF_MASK;
+                if cli.ext_id_above_sff && id <= CAN_SFF_MASK {
+                    id = CAN_SFF_MASK + 1 + (id % (CAN_EFF_MASK - CAN_SFF_MASK));
+                }
+                id | CAN_EFF_FLAG
             } else {
-                burst_low_interval
+                raw_id & CAN_SFF_MASK
             };
-            wait_until(next_send);
-            next_send += current_interval;
-            let now = Instant::now();
-            if next_send < now {
-                next_send = now + current_interval;
-            }
-        } else if !max_rate {
-            wait_until(next_send);
-            next_send += interval;
-            let now = Instant::now();
-            if next_send < now {
-                next_send = now + interval;
-            }
-        }
 
-        // ── Send ──
-        match send_frame(fd, &frame) {
-            Ok(()) => sent += 1,
-            Err(e) => {
-                errors += 1;
-                if errors <= 5 {
-                    eprintln!("warning: write failed: {}", e);
+            // ── DLC ──
+            frame.can_dlc = rng.range_u8(dlc_min, dlc_max).min(CAN_MAX_DLC);
+
+            // ── Data ──
+            match cli.data_mode {
+                DataMode::Random => {
+                    let r1 = rng.next();
+                    frame.data[..8].copy_from_slice(&r1.to_ne_bytes());
                 }
-                if errors == 5 {
-                    eprintln!("warning: suppressing further write errors");
+                DataMode::Zero => {
+                    frame.data = [0u8; 8];
                 }
-                // ENOBUFS is transient on busy interfaces — keep going
-                if e.raw_os_error() != Some(libc::ENOBUFS) && errors > 100 {
-                    eprintln!("error: too many write errors, aborting");
-                    break;
+                DataMode::Ones => {
+                    frame.data = [0xFFu8; 8];
+                }
+                DataMode::Counter => {
+                    frame.data = [counter; 8];
+                    counter = counter.wrapping_add(1);
+                }
+                DataMode::Sequence => {
+                    frame.data[..8].copy_from_slice(&seqnum.to_be_bytes());
+                    seqnum = seqnum.wrapping_add(1);
+                }
+                DataMode::QualityTest => {
+                    let elapsed_ms = t_start.elapsed().as_millis() as u16;
+                    frame.data[0] = 0xCA;
+                    frame.data[1] = 0xFE;
+                    frame.data[2..4].copy_from_slice(&qt_seqnum.to_be_bytes());
+                    frame.data[4..6].copy_from_slice(&elapsed_ms.to_be_bytes());
+                    frame.data[6] = cli.test_id;
+                    frame.data[7] = frame.data[..7].iter().fold(0u8, |acc, &b| acc ^ b);
+                    qt_seqnum = qt_seqnum.wrapping_add(1);
                 }
             }
-        }
 
-        // ── Progress ──
-        if cli.progress > 0 && sent % cli.progress == 0 && sent > 0 && !cli.quiet {
-            let elapsed = t_start.elapsed().as_secs_f64();
-            eprintln!(
-                "  sent {} frames in {:.2}s ({:.0} fps)",
-                sent,
-                elapsed,
-                sent as f64 / elapsed,
-            );
+            // ── Rate limiting ──
+            if cli.burst {
+                // Check for phase transition
+                let phase_dur = if burst_phase_high {
+                    burst_high_dur
+                } else {
+                    burst_low_dur
+                };
+                if burst_phase_start.elapsed() >= phase_dur {
+                    burst_phase_high = !burst_phase_high;
+                    burst_phase_start = Instant::now();
+                    next_send = burst_phase_start;
+                }
+
+                let current_interval = if burst_phase_high {
+                    burst_high_interval
+                } else {
+                    burst_low_interval
+                };
+                wait_until(next_send);
+                next_send += current_interval;
+                let now = Instant::now();
+                if next_send < now {
+                    next_send = now + current_interval;
+                }
+            } else {
+                wait_until(next_send);
+                next_send += interval;
+                let now = Instant::now();
+                if next_send < now {
+                    next_send = now + interval;
+                }
+            }
+
+            // ── Send ──
+            match send_frame(fd, &frame) {
+                Ok(()) => sent += 1,
+                Err(e) => {
+                    errors += 1;
+                    if errors <= 5 {
+                        eprintln!("warning: write failed: {}", e);
+                    }
+                    if errors == 5 {
+                        eprintln!("warning: suppressing further write errors");
+                    }
+                    // ENOBUFS is transient on busy interfaces — keep going
+                    if e.raw_os_error() != Some(libc::ENOBUFS) && errors > 100 {
+                        eprintln!("error: too many write errors, aborting");
+                        break;
+                    }
+                }
+            }
+
+            // ── Progress ──
+            if cli.progress > 0 && sent % cli.progress == 0 && sent > 0 && !cli.quiet {
+                let elapsed = t_start.elapsed().as_secs_f64();
+                eprintln!(
+                    "  sent {} frames in {:.2}s ({:.0} fps)",
+                    sent,
+                    elapsed,
+                    sent as f64 / elapsed,
+                );
+            }
         }
-    }
+    } // else (rate-limited)
 
     let elapsed = t_start.elapsed();
 
@@ -1319,5 +1479,240 @@ fn main() {
             if secs > 0.0 { sent as f64 / secs } else { 0.0 },
             errors,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Try to open a CAN socket on can0.  Returns None if unavailable
+    /// (no interface, no permissions), so tests can skip gracefully.
+    fn try_open_can0() -> Option<i32> {
+        open_can_socket("can0").ok()
+    }
+
+    // ── Correctness: send_frame delivers a valid frame ───────────────
+
+    #[test]
+    fn test_send_frame_correctness() {
+        let fd = match try_open_can0() {
+            Some(fd) => fd,
+            None => {
+                eprintln!("SKIP: can0 not available");
+                return;
+            }
+        };
+
+        let frame = CanFrame {
+            can_id: 0x123,
+            can_dlc: 8,
+            __pad: 0,
+            __res0: 0,
+            __res1: 0,
+            data: [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE],
+        };
+
+        // Should succeed without error
+        let result = send_frame(fd, &frame);
+        unsafe { libc::close(fd) };
+        assert!(result.is_ok(), "send_frame failed: {:?}", result.err());
+    }
+
+    // ── Correctness: send_frames_batch delivers all frames ───────────
+
+    #[test]
+    fn test_send_frames_batch_correctness() {
+        let fd = match try_open_can0() {
+            Some(fd) => fd,
+            None => {
+                eprintln!("SKIP: can0 not available");
+                return;
+            }
+        };
+
+        let mut frames = [CanFrame {
+            can_id: 0,
+            can_dlc: 8,
+            __pad: 0,
+            __res0: 0,
+            __res1: 0,
+            data: [0; 8],
+        }; BATCH_SIZE];
+
+        for (i, f) in frames.iter_mut().enumerate() {
+            f.can_id = (i as u32) & CAN_SFF_MASK;
+            f.data[0] = i as u8;
+        }
+
+        let result = send_frames_batch(fd, &frames);
+        unsafe { libc::close(fd) };
+        match result {
+            Ok(n) => assert_eq!(n, BATCH_SIZE, "expected {BATCH_SIZE} frames sent, got {n}"),
+            Err(e) => panic!("send_frames_batch failed: {e}"),
+        }
+    }
+
+    // ── Correctness: batch count matches requested ───────────────────
+
+    #[test]
+    fn test_send_frames_batch_partial() {
+        let fd = match try_open_can0() {
+            Some(fd) => fd,
+            None => {
+                eprintln!("SKIP: can0 not available");
+                return;
+            }
+        };
+
+        let frames: Vec<CanFrame> = (0..7)
+            .map(|i| CanFrame {
+                can_id: i as u32,
+                can_dlc: 1,
+                __pad: 0,
+                __res0: 0,
+                __res1: 0,
+                data: [i as u8; 8],
+            })
+            .collect();
+
+        let result = send_frames_batch(fd, &frames);
+        unsafe { libc::close(fd) };
+        match result {
+            Ok(n) => assert_eq!(n, 7, "expected 7 frames sent, got {n}"),
+            Err(e) => panic!("send_frames_batch failed: {e}"),
+        }
+    }
+
+    // ── Performance: sendmmsg vs write throughput ─────────────────────
+
+    #[test]
+    fn bench_sendmmsg_vs_write() {
+        let fd = match try_open_can0() {
+            Some(fd) => fd,
+            None => {
+                eprintln!("SKIP: can0 not available");
+                return;
+            }
+        };
+
+        let total_frames: usize = 100_000;
+        let frame = CanFrame {
+            can_id: 0x7FF,
+            can_dlc: 8,
+            __pad: 0,
+            __res0: 0,
+            __res1: 0,
+            data: [0xAA; 8],
+        };
+
+        // ── Benchmark: individual write() calls ──
+        let start = Instant::now();
+        let mut sent_write: usize = 0;
+        for _ in 0..total_frames {
+            if send_frame(fd, &frame).is_ok() {
+                sent_write += 1;
+            }
+        }
+        let write_elapsed = start.elapsed();
+
+        // ── Benchmark: sendmmsg() batching ──
+        let batch = [frame; BATCH_SIZE];
+        let start = Instant::now();
+        let mut sent_batch: usize = 0;
+        while sent_batch < total_frames {
+            let remaining = total_frames - sent_batch;
+            let count = remaining.min(BATCH_SIZE);
+            match send_frames_batch(fd, &batch[..count]) {
+                Ok(n) => sent_batch += n,
+                Err(_) => break,
+            }
+        }
+        let batch_elapsed = start.elapsed();
+
+        unsafe { libc::close(fd) };
+
+        let write_fps = sent_write as f64 / write_elapsed.as_secs_f64();
+        let batch_fps = sent_batch as f64 / batch_elapsed.as_secs_f64();
+        let speedup = batch_fps / write_fps;
+
+        eprintln!("\n=== sendmmsg vs write benchmark ({total_frames} frames) ===");
+        eprintln!(
+            "  write():    {sent_write} frames in {:.3}s = {write_fps:.0} fps",
+            write_elapsed.as_secs_f64()
+        );
+        eprintln!(
+            "  sendmmsg(): {sent_batch} frames in {:.3}s = {batch_fps:.0} fps",
+            batch_elapsed.as_secs_f64()
+        );
+        eprintln!("  speedup:    {speedup:.2}x");
+
+        // sendmmsg should be at least as fast as write (no regression)
+        assert!(
+            speedup >= 0.95,
+            "sendmmsg was significantly slower than write: {speedup:.2}x"
+        );
+        // On vcan, expect at least some improvement
+        if speedup > 1.05 {
+            eprintln!("  PASS: sendmmsg is {speedup:.2}x faster");
+        } else {
+            eprintln!("  NOTE: similar performance (expected on virtual CAN)");
+        }
+    }
+
+    // ── Precision: wait_until with clock_nanosleep ───────────────────
+
+    #[test]
+    fn test_wait_until_precision() {
+        let intervals = [
+            Duration::from_micros(200), // 5000 fps
+            Duration::from_millis(1),   // 1000 fps
+            Duration::from_millis(5),   // 200 fps
+            Duration::from_millis(20),  // 50 fps
+        ];
+
+        eprintln!("\n=== wait_until precision test ===");
+
+        for &interval in &intervals {
+            let iterations = 500;
+            let mut max_overshoot = Duration::ZERO;
+            let mut total_overshoot = Duration::ZERO;
+
+            let mut target = Instant::now() + interval;
+            for _ in 0..iterations {
+                wait_until(target);
+                let now = Instant::now();
+                let overshoot = now.duration_since(target);
+                total_overshoot += overshoot;
+                if overshoot > max_overshoot {
+                    max_overshoot = overshoot;
+                }
+                target += interval;
+                // Reset if we fell behind
+                if target < now {
+                    target = now + interval;
+                }
+            }
+
+            let avg_us = total_overshoot.as_micros() as f64 / iterations as f64;
+            let max_us = max_overshoot.as_micros();
+            let interval_us = interval.as_micros();
+
+            eprintln!(
+                "  interval={interval_us:>6}µs  avg_overshoot={avg_us:>6.1}µs  max_overshoot={max_us:>6}µs"
+            );
+
+            // Average overshoot should be well under 1ms
+            assert!(
+                avg_us < 500.0,
+                "avg overshoot {avg_us:.1}µs too high for {interval_us}µs interval"
+            );
+            // Max overshoot should be under 2ms (scheduling jitter)
+            assert!(
+                max_us < 2000,
+                "max overshoot {max_us}µs too high for {interval_us}µs interval"
+            );
+        }
     }
 }
