@@ -5,12 +5,20 @@ on:
     tags:
       - "v*"
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust stable
-        run: rustup update stable && rustup default stable && rustup component add clippy
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add clippy
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - run: rustc --version
       - run: cargo check
       - run: cargo clippy -- -D warnings
