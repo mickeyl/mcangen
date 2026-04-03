@@ -106,12 +106,16 @@ struct Cli {
     dlc_max: u8,
 
     /// Minimum CAN ID (hex or decimal)
-    #[arg(long, default_value = "0x000", value_parser = parse_hex_u32)]
-    id_min: u32,
+    #[arg(long, value_parser = parse_hex_u32, conflicts_with = "id")]
+    id_min: Option<u32>,
 
     /// Maximum CAN ID (hex or decimal). Defaults to 0x7FF (standard) or 0x1FFFFFFF (extended/mixed).
-    #[arg(long, value_parser = parse_hex_u32)]
+    #[arg(long, value_parser = parse_hex_u32, conflicts_with = "id")]
     id_max: Option<u32>,
+
+    /// Exact CAN ID (hex or decimal). Required for quality-test mode.
+    #[arg(long, value_parser = parse_hex_u32, required_if_eq("data_mode", "quality-test"))]
+    id: Option<u32>,
 
     /// ID type: standard (11-bit), extended (29-bit), or mixed
     #[arg(long, value_enum, default_value_t = IdKind::Standard)]
@@ -1135,8 +1139,14 @@ fn main() {
         IdKind::Standard => CAN_SFF_MASK,
         IdKind::Extended | IdKind::Mixed => CAN_EFF_MASK,
     };
-    let id_min = cli.id_min.min(id_ceiling);
-    let id_max = cli.id_max.unwrap_or(id_ceiling).min(id_ceiling);
+    let (id_min, id_max) = if let Some(id) = cli.id {
+        let id = id.min(id_ceiling);
+        (id, id)
+    } else {
+        let id_min = cli.id_min.unwrap_or(0).min(id_ceiling);
+        let id_max = cli.id_max.unwrap_or(id_ceiling).min(id_ceiling);
+        (id_min, id_max)
+    };
     if id_min > id_max {
         eprintln!(
             "error: --id-min (0x{:X}) must be <= --id-max (0x{:X})",
@@ -1494,6 +1504,42 @@ mod tests {
     }
 
     // ── Correctness: send_frame delivers a valid frame ───────────────
+
+    #[test]
+    fn test_quality_test_requires_exact_id() {
+        let err = Cli::try_parse_from(["mcangen", "vcan0", "--data-mode", "quality-test"])
+            .expect_err("quality-test mode must require --id");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--id"),
+            "expected clap error to mention --id, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_quality_test_accepts_exact_id() {
+        let cli = Cli::try_parse_from([
+            "mcangen",
+            "vcan0",
+            "--data-mode",
+            "quality-test",
+            "--id",
+            "0x7E0",
+        ])
+        .expect("quality-test mode should accept --id");
+        assert_eq!(cli.id, Some(0x7E0));
+    }
+
+    #[test]
+    fn test_exact_id_conflicts_with_id_range() {
+        let err = Cli::try_parse_from(["mcangen", "vcan0", "--id", "0x123", "--id-min", "0x100"])
+            .expect_err("--id should conflict with --id-min");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--id") && msg.contains("--id-min"),
+            "expected clap conflict error to mention --id and --id-min, got: {msg}"
+        );
+    }
 
     #[test]
     fn test_send_frame_correctness() {

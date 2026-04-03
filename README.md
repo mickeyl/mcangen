@@ -56,6 +56,7 @@ Typical use cases:
 - **Configurable DLC** — any range from 0 to 8 bytes
 - **Data patterns** — random, zeros, ones (0xFF), incrementing counter,
   64-bit big-endian sequence number, or CANcorder quality-test protocol
+  on an exact CAN ID via `--id`
 - **UDS flash simulation** — realistic ECU reprogramming session with
   proper ISO-TP framing, security access, memory erase, firmware transfer,
   DTC handling, and ECU reset — both tester and ECU sides on the bus
@@ -195,12 +196,13 @@ Customise with `--burst-high-rate`, `--burst-low-rate`, `--burst-high-ms`,
 **CANcorder quality-test protocol on a fixed ID:**
 
 ```bash
-mcangen can0 --data-mode quality-test --id-min 0x7E0 --id-max 0x7E0 -r 1000 -n 10000
+mcangen can0 --data-mode quality-test --id 0x7E0 -r 1000 -n 10000
 ```
 
 Generates frames with the 0xCAFE magic marker, 16-bit sequence number,
 16-bit timestamp offset, test ID, and XOR checksum — ready for
 CANcorder's quality test panel.
+In this mode, `--id` is required and `--id-min`/`--id-max` are rejected.
 
 **Quiet mode for scripting (exit code only):**
 
@@ -218,6 +220,7 @@ mcangen can0 -n 10000 -q && echo "done"
 | `--dlc-max N` | Maximum DLC (0–8) | `8` |
 | `--id-min ID` | Minimum CAN ID (hex or decimal) | `0x000` |
 | `--id-max ID` | Maximum CAN ID (hex or decimal) | `0x7FF` / `0x1FFFFFFF` |
+| `--id ID` | Exact CAN ID; required for `quality-test` mode | none |
 | `--id-kind MODE` | `standard`, `extended`, or `mixed` | `standard` |
 | `--ext-id-above-sff` | Keep extended IDs > 0x7FF to avoid misdetection | `true` |
 | `--id-mode MODE` | `random` or `sequential` | `random` |

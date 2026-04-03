@@ -34,7 +34,7 @@ Single-file application: everything is in `src/main.rs` (~900 lines). No modules
 
 1. **SocketCAN FFI** — `CanFrame`, `SockaddrCan`, `Ifreq` structs matching kernel layout. `open_can_socket()` does socket/ioctl/bind. `send_frame()` does raw `libc::write`.
 
-2. **CLI** — clap derive macros. Three enums control behavior: `IdMode` (random/sequential), `DataMode` (random/zero/counter/sequence/ones/quality-test), `IdKind` (standard/extended/mixed). The `Cli` struct has two groups of options: standard frame generation and UDS flash mode (`--uds-flash` and its `--tester-id`, `--ecu-id`, `--speed`, `--transfer-blocks`, `--no-obd`, `--no-errors`).
+2. **CLI** — clap derive macros. Three enums control behavior: `IdMode` (random/sequential), `DataMode` (random/zero/counter/sequence/ones/quality-test), `IdKind` (standard/extended/mixed). The `Cli` struct has two groups of options: standard frame generation and UDS flash mode (`--uds-flash` and its `--tester-id`, `--ecu-id`, `--speed`, `--transfer-blocks`, `--no-obd`, `--no-errors`). Standard mode supports either an ID range (`--id-min`/`--id-max`) or an exact `--id`; `quality-test` requires the exact-ID form.
 
 3. **RNG** — Custom xorshift64* PRNG (`Rng` struct). Methods include `uniform()` for float ranges, `delay_us()` for randomized timing in microseconds, `chance()` for probability checks, `fill_bytes()` for bulk random data.
 
