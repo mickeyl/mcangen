@@ -20,8 +20,9 @@ jobs:
           - aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.88.0"
           targets: ${{ matrix.target }}
       - name: Install cross-compilation tools
         run: cargo install cross --git https://github.com/cross-rs/cross
