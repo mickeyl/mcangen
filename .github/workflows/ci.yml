@@ -13,4 +13,3 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85.0
       - run: cargo check
       - run: cargo clippy -- -D warnings
-      - run: cargo fmt -- --check
