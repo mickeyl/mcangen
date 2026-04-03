@@ -1,8 +1,8 @@
 [package]
 name = "mcangen"
-version = "1.5.0"
+version = "1.5.1"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "High-performance CAN bus frame generator for testing and benchmarking"
 license = "MIT"
 authors = ["Dr. Michael 'Mickey' Lauer <mickey@vanille-media.de>"]
