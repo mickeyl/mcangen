@@ -1462,7 +1462,7 @@ fn main() {
             }
 
             // ── Progress ──
-            if cli.progress > 0 && sent % cli.progress == 0 && sent > 0 && !cli.quiet {
+            if cli.progress > 0 && sent.is_multiple_of(cli.progress) && sent > 0 && !cli.quiet {
                 let elapsed = t_start.elapsed().as_secs_f64();
                 eprintln!(
                     "  sent {} frames in {:.2}s ({:.0} fps)",

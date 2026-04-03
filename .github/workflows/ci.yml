@@ -5,13 +5,17 @@ on:
     tags:
       - "v*"
 
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: 1.94.1
+
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
-        with:
-          components: clippy
+      - name: Install Rust 1.94.1
+        run: rustup toolchain install 1.94.1 --profile minimal && rustup component add --toolchain 1.94.1 clippy
+      - run: rustc --version
       - run: cargo check
       - run: cargo clippy -- -D warnings
