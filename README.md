@@ -71,7 +71,7 @@ Typical use cases:
 ## Requirements
 
 - Linux with SocketCAN support (kernel 2.6.25+)
-- Rust stable toolchain (1.70+)
+- Rust toolchain 1.85+
 - `CAP_NET_RAW` capability or root access
 
 ## Building

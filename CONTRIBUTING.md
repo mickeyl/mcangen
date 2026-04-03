@@ -4,7 +4,7 @@ Thanks for your interest in contributing!
 
 ## Building
 
-You need a stable Rust toolchain (1.70+) and a Linux system with SocketCAN headers.
+You need Rust 1.85+ and a Linux system with SocketCAN headers.
 
 ```bash
 make build
