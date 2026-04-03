@@ -24,7 +24,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - name: Install cross-compilation tools
-        run: cargo install cross
+        run: cargo install cross --locked
       - name: Build
         run: cross build --release --target ${{ matrix.target }}
       - name: Package
