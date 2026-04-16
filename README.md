@@ -66,6 +66,10 @@ Typical use cases:
   for sub-microsecond accuracy from 1 fps to line rate
 - **Exact counts** — send a precise number of frames then stop
 - **Reproducible** — seed the PRNG for deterministic, repeatable runs
+- **Live stats** — automatic fps/count/error display on interactive
+  terminals, updated every second
+- **Frame dump** — `--dump` prints each sent frame to stdout in candump
+  format for inspection or piping
 - **Minimal dependencies** — just `clap`, `libc`, `nix`, and `fastrand`
 
 ## Requirements
@@ -228,7 +232,6 @@ mcangen can0 -n 10000 -q && echo "done"
 | `-s, --seed SEED` | RNG seed (0 = random) | `0` |
 | `-p, --progress N` | Print stats every N frames | `0` |
 | `-q, --quiet` | Suppress all output except errors | off |
-| `--stats` | Show live statistics (fps, count, errors) updated every second | off |
 | `--dump` | Dump sent frames to stdout in candump format | off |
 | `--burst` | Enable burst mode (alternating high/low rate) | off |
 | `--burst-high-rate FPS` | High-rate phase FPS | `5000` |

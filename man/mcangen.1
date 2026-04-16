@@ -1,4 +1,4 @@
-.TH MCANGEN 1 "2026-04-16" "mcangen 1.6.0" "User Commands"
+.TH MCANGEN 1 "2026-04-16" "mcangen 1.7.0" "User Commands"
 .SH NAME
 mcangen \- high-performance CAN bus frame generator
 .SH SYNOPSIS
@@ -73,15 +73,11 @@ summary (default: \fB0\fR).
 .BR \-q ", " \-\-quiet
 Suppress all output except errors.
 .TP
-.BR \-\-stats
-Show live statistics (frames sent, instantaneous and average fps, errors,
-elapsed time) on stderr, updated every second. The line is overwritten in
-place using carriage return. Ignored when \fB\-\-quiet\fR is set.
-.TP
 .BR \-\-dump
 Dump each sent frame to stdout in candump format. Uses a bounded internal
 buffer; at very high rates some frames may be silently dropped from the
-dump output without affecting actual transmission.
+dump output without affecting actual transmission. Disables the live stats
+line.
 .TP
 .BR \-\-burst
 Enable burst mode: alternate between a high-rate and a low-rate phase,
@@ -251,6 +247,11 @@ resets rather than bursting to catch up.
 When \fB\-\-rate\fR is 0, frames are sent back-to-back with no
 delay. Actual throughput will be limited by the kernel's send buffer and the
 CAN bus bitrate. The default rate is 5\ fps, matching cangen's default 200\ ms gap.
+.SH LIVE STATISTICS
+When stderr is connected to an interactive terminal (and \fB\-\-quiet\fR and
+\fB\-\-dump\fR are not set), mcangen displays a continuously updated status
+line showing frames sent, instantaneous and average fps, error count, and
+elapsed time. The line is overwritten in place every second.
 .SH BURST MODE
 When \fB\-\-burst\fR is given, mcangen cycles between a high-rate phase and a
 low-rate phase. This emulates the traffic pattern typical of ECU

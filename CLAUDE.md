@@ -42,7 +42,7 @@ Single-file application: everything is in `src/main.rs` (~1900 lines). No module
 
 5. **UDS Flash simulation** — `TimedFrame` struct holds a CAN ID, 8-byte payload, and pre-delay in microseconds (can_id=0 means delay-only marker). ISO-TP helpers (`push_sf`, `push_nrc`, `push_multi`) build single-frame, negative response, and multi-frame (FF+FC+CFs) sequences. `gen_uds_session()` orchestrates 16 phases of a realistic ECU reprogramming session. `gen_obd_polling()` produces inter-session OBD-II traffic. `play_timed_frames()` sends the pre-generated frame list with scaled timing. `run_uds_flash()` is the top-level loop.
 
-6. **Live monitoring** — `LiveState` struct with atomic counters (`sent`, `errors`, `running`) shared between the main send loop and optional background threads. `stats_thread()` prints a `\r`-overwritten stats line to stderr every second. `dump_thread()` reads frames from a bounded `mpsc::sync_channel` and prints candump-style output to stdout; frames are dropped silently if the channel is full.
+6. **Live monitoring** — `LiveState` struct with atomic counters (`sent`, `errors`, `running`) shared between the main send loop and background threads. `stats_thread()` prints a `\r`-overwritten stats line to stderr every second; it is spawned automatically when stderr is a TTY (unless `--quiet` or `--dump` is set). `dump_thread()` reads frames from a bounded `mpsc::sync_channel` and prints candump-style output to stdout; frames are dropped silently if the channel is full.
 
 7. **main()** — Validates args, opens socket, spawns optional stats/dump threads, dispatches to either `run_uds_flash()` (early return) or the standard frame-generation loop with burst/constant/max-rate timing, then joins monitoring threads.
 

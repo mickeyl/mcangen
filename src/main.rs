@@ -147,10 +147,6 @@ struct Cli {
     #[arg(short = 'q', long)]
     quiet: bool,
 
-    /// Show live statistics (fps, count, errors) updated every second
-    #[arg(long)]
-    stats: bool,
-
     /// Dump sent frames to stdout in candump format
     #[arg(long)]
     dump: bool,
@@ -1160,26 +1156,33 @@ fn stats_thread(state: Arc<LiveState>, interface: String) {
 
 fn dump_thread(rx: mpsc::Receiver<CanFrame>, interface: String) {
     use std::io::Write;
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
 
     while let Ok(frame) = rx.recv() {
         let is_ext = frame.can_id & CAN_EFF_FLAG != 0;
         let id = frame.can_id & if is_ext { CAN_EFF_MASK } else { CAN_SFF_MASK };
         let dlc = frame.can_dlc as usize;
 
+        let mut line = String::with_capacity(64);
         if is_ext {
-            let _ = write!(out, "  {}  {:08X}   [{}] ", interface, id, dlc);
+            std::fmt::Write::write_fmt(
+                &mut line,
+                format_args!("  {}  {:08X}   [{}]", interface, id, dlc),
+            )
+            .unwrap();
         } else {
-            let _ = write!(out, "  {}  {:03X}   [{}] ", interface, id, dlc);
+            std::fmt::Write::write_fmt(
+                &mut line,
+                format_args!("  {}  {:03X}   [{}]", interface, id, dlc),
+            )
+            .unwrap();
         }
         for i in 0..dlc {
-            if i > 0 {
-                let _ = write!(out, " ");
-            }
-            let _ = write!(out, "{:02X}", frame.data[i]);
+            std::fmt::Write::write_fmt(&mut line, format_args!(" {:02X}", frame.data[i])).unwrap();
         }
-        let _ = writeln!(out);
+
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let _ = writeln!(out, "{}", line);
     }
 }
 
@@ -1269,7 +1272,8 @@ fn main() {
     // ── Live monitoring threads ──
     let live = LiveState::new();
 
-    let stats_handle = if cli.stats && !cli.quiet {
+    let show_stats = !cli.quiet && !cli.dump && unsafe { libc::isatty(libc::STDERR_FILENO) == 1 };
+    let stats_handle = if show_stats {
         let s = Arc::clone(&live);
         let iface = cli.interface.clone();
         Some(
