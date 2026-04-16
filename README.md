@@ -228,6 +228,8 @@ mcangen can0 -n 10000 -q && echo "done"
 | `-s, --seed SEED` | RNG seed (0 = random) | `0` |
 | `-p, --progress N` | Print stats every N frames | `0` |
 | `-q, --quiet` | Suppress all output except errors | off |
+| `--stats` | Show live statistics (fps, count, errors) updated every second | off |
+| `--dump` | Dump sent frames to stdout in candump format | off |
 | `--burst` | Enable burst mode (alternating high/low rate) | off |
 | `--burst-high-rate FPS` | High-rate phase FPS | `5000` |
 | `--burst-low-rate FPS` | Low-rate phase FPS | `50` |

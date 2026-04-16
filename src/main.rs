@@ -1,6 +1,8 @@
 use clap::{Parser, ValueEnum};
 use std::io;
 use std::mem;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 // ── SocketCAN constants & structs ──────────────────────────────────────────
@@ -144,6 +146,14 @@ struct Cli {
     /// Suppress all output except errors
     #[arg(short = 'q', long)]
     quiet: bool,
+
+    /// Show live statistics (fps, count, errors) updated every second
+    #[arg(long)]
+    stats: bool,
+
+    /// Dump sent frames to stdout in candump format
+    #[arg(long)]
+    dump: bool,
 
     /// Enable burst mode: alternate between high-rate and low-rate periods (emulates ECU reprogramming)
     #[arg(long)]
@@ -970,7 +980,13 @@ fn gen_obd_polling(ecu: u32, cycles: usize, rng: &mut Rng) -> Vec<TimedFrame> {
 
 // ── Frame playback ────────────────────────────────────────────────────────
 
-fn play_timed_frames(fd: i32, frames: &[TimedFrame], speed: f64) -> (u64, u64) {
+fn play_timed_frames(
+    fd: i32,
+    frames: &[TimedFrame],
+    speed: f64,
+    live: &LiveState,
+    dump_tx: &Option<mpsc::SyncSender<CanFrame>>,
+) -> (u64, u64) {
     let mut sent: u64 = 0;
     let mut errs: u64 = 0;
     let mut next = Instant::now();
@@ -993,9 +1009,16 @@ fn play_timed_frames(fd: i32, frames: &[TimedFrame], speed: f64) -> (u64, u64) {
             data: tf.data,
         };
         match send_frame(fd, &frame) {
-            Ok(()) => sent += 1,
+            Ok(()) => {
+                sent += 1;
+                live.sent.store(sent, Ordering::Relaxed);
+                if let Some(ref tx) = dump_tx {
+                    let _ = tx.try_send(frame);
+                }
+            }
             Err(e) => {
                 errs += 1;
+                live.errors.store(errs, Ordering::Relaxed);
                 if errs <= 3 {
                     eprintln!("warning: write failed: {}", e);
                 }
@@ -1007,7 +1030,12 @@ fn play_timed_frames(fd: i32, frames: &[TimedFrame], speed: f64) -> (u64, u64) {
 
 // ── UDS Flash runner ──────────────────────────────────────────────────────
 
-fn run_uds_flash(fd: i32, cli: &Cli) {
+fn run_uds_flash(
+    fd: i32,
+    cli: &Cli,
+    live: &LiveState,
+    dump_tx: &Option<mpsc::SyncSender<CanFrame>>,
+) {
     let tester = cli.tester_id;
     let ecu = cli.ecu_id;
     let speed = cli.speed;
@@ -1048,7 +1076,7 @@ fn run_uds_flash(fd: i32, cli: &Cli) {
 
         let uds_frames = gen_uds_session(tester, ecu, num_blocks, errors, &mut rng);
         let s_start = Instant::now();
-        let (sent, errs) = play_timed_frames(fd, &uds_frames, speed);
+        let (sent, errs) = play_timed_frames(fd, &uds_frames, speed, live, dump_tx);
         total_sent += sent;
         total_errs += errs;
 
@@ -1066,7 +1094,7 @@ fn run_uds_flash(fd: i32, cli: &Cli) {
         if !cli.no_obd && (unlimited || sessions < cli.count) {
             let obd_cycles = rng.range_u32(15, 30) as usize;
             let obd_frames = gen_obd_polling(ecu, obd_cycles, &mut rng);
-            let (s, e) = play_timed_frames(fd, &obd_frames, speed);
+            let (s, e) = play_timed_frames(fd, &obd_frames, speed, live, dump_tx);
             total_sent += s;
             total_errs += e;
 
@@ -1081,6 +1109,77 @@ fn run_uds_flash(fd: i32, cli: &Cli) {
             "mcangen: done — {} sessions, {} frames in {:.1}s ({} errors)",
             sessions, total_sent, secs, total_errs,
         );
+    }
+}
+
+// ── Live monitoring ───────────────────────────────────────────────────────
+
+struct LiveState {
+    sent: AtomicU64,
+    errors: AtomicU64,
+    running: AtomicBool,
+}
+
+impl LiveState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            sent: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            running: AtomicBool::new(true),
+        })
+    }
+}
+
+fn stats_thread(state: Arc<LiveState>, interface: String) {
+    let start = Instant::now();
+    let mut prev_sent: u64 = 0;
+
+    while state.running.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_secs(1));
+        if !state.running.load(Ordering::Relaxed) {
+            break;
+        }
+        let sent = state.sent.load(Ordering::Relaxed);
+        let errors = state.errors.load(Ordering::Relaxed);
+        let elapsed = start.elapsed().as_secs_f64();
+        let instant_fps = (sent - prev_sent) as f64;
+        let avg_fps = if elapsed > 0.0 {
+            sent as f64 / elapsed
+        } else {
+            0.0
+        };
+        prev_sent = sent;
+
+        eprint!(
+            "\r{}: {} frames | {:.0} fps (avg {:.0}) | {} err | {:.1}s    ",
+            interface, sent, instant_fps, avg_fps, errors, elapsed,
+        );
+    }
+    eprintln!();
+}
+
+fn dump_thread(rx: mpsc::Receiver<CanFrame>, interface: String) {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+
+    while let Ok(frame) = rx.recv() {
+        let is_ext = frame.can_id & CAN_EFF_FLAG != 0;
+        let id = frame.can_id & if is_ext { CAN_EFF_MASK } else { CAN_SFF_MASK };
+        let dlc = frame.can_dlc as usize;
+
+        if is_ext {
+            let _ = write!(out, "  {}  {:08X}   [{}] ", interface, id, dlc);
+        } else {
+            let _ = write!(out, "  {}  {:03X}   [{}] ", interface, id, dlc);
+        }
+        for i in 0..dlc {
+            if i > 0 {
+                let _ = write!(out, " ");
+            }
+            let _ = write!(out, "{:02X}", frame.data[i]);
+        }
+        let _ = writeln!(out);
     }
 }
 
@@ -1167,8 +1266,41 @@ fn main() {
         std::process::exit(1);
     });
 
+    // ── Live monitoring threads ──
+    let live = LiveState::new();
+
+    let stats_handle = if cli.stats && !cli.quiet {
+        let s = Arc::clone(&live);
+        let iface = cli.interface.clone();
+        Some(
+            std::thread::Builder::new()
+                .name("stats".into())
+                .spawn(move || stats_thread(s, iface))
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+
+    let dump_tx: Option<mpsc::SyncSender<CanFrame>> = if cli.dump {
+        let (tx, rx) = mpsc::sync_channel::<CanFrame>(4096);
+        let iface = cli.interface.clone();
+        std::thread::Builder::new()
+            .name("dump".into())
+            .spawn(move || dump_thread(rx, iface))
+            .unwrap();
+        Some(tx)
+    } else {
+        None
+    };
+
     if cli.uds_flash {
-        run_uds_flash(fd, &cli);
+        run_uds_flash(fd, &cli, &live, &dump_tx);
+        live.running.store(false, Ordering::Relaxed);
+        drop(dump_tx);
+        if let Some(h) = stats_handle {
+            let _ = h.join();
+        }
         unsafe {
             libc::close(fd);
         }
@@ -1305,14 +1437,29 @@ fn main() {
 
             // Send the batch
             match send_frames_batch(fd, &batch[..batch_count]) {
-                Ok(n) => sent += n as u64,
+                Ok(n) => {
+                    sent += n as u64;
+                    live.sent.store(sent, Ordering::Relaxed);
+                    if let Some(ref tx) = dump_tx {
+                        for bf in &batch[..n] {
+                            let _ = tx.try_send(*bf);
+                        }
+                    }
+                }
                 Err(e) => {
                     // Fallback: send individually on batch failure
                     for f in &batch[..batch_count] {
                         match send_frame(fd, f) {
-                            Ok(()) => sent += 1,
+                            Ok(()) => {
+                                sent += 1;
+                                live.sent.store(sent, Ordering::Relaxed);
+                                if let Some(ref tx) = dump_tx {
+                                    let _ = tx.try_send(*f);
+                                }
+                            }
                             Err(e) => {
                                 errors += 1;
+                                live.errors.store(errors, Ordering::Relaxed);
                                 if e.raw_os_error() != Some(libc::ENOBUFS) && errors > 100 {
                                     eprintln!("error: too many write errors, aborting");
                                     break 'max_rate;
@@ -1444,9 +1591,16 @@ fn main() {
 
             // ── Send ──
             match send_frame(fd, &frame) {
-                Ok(()) => sent += 1,
+                Ok(()) => {
+                    sent += 1;
+                    live.sent.store(sent, Ordering::Relaxed);
+                    if let Some(ref tx) = dump_tx {
+                        let _ = tx.try_send(frame);
+                    }
+                }
                 Err(e) => {
                     errors += 1;
+                    live.errors.store(errors, Ordering::Relaxed);
                     if errors <= 5 {
                         eprintln!("warning: write failed: {}", e);
                     }
@@ -1475,6 +1629,12 @@ fn main() {
     } // else (rate-limited)
 
     let elapsed = t_start.elapsed();
+
+    live.running.store(false, Ordering::Relaxed);
+    drop(dump_tx);
+    if let Some(h) = stats_handle {
+        let _ = h.join();
+    }
 
     unsafe {
         libc::close(fd);

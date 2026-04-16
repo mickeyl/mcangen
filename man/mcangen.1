@@ -1,4 +1,4 @@
-.TH MCANGEN 1 "2026-04-03" "mcangen 1.5.0" "User Commands"
+.TH MCANGEN 1 "2026-04-16" "mcangen 1.6.0" "User Commands"
 .SH NAME
 mcangen \- high-performance CAN bus frame generator
 .SH SYNOPSIS
@@ -72,6 +72,16 @@ summary (default: \fB0\fR).
 .TP
 .BR \-q ", " \-\-quiet
 Suppress all output except errors.
+.TP
+.BR \-\-stats
+Show live statistics (frames sent, instantaneous and average fps, errors,
+elapsed time) on stderr, updated every second. The line is overwritten in
+place using carriage return. Ignored when \fB\-\-quiet\fR is set.
+.TP
+.BR \-\-dump
+Dump each sent frame to stdout in candump format. Uses a bounded internal
+buffer; at very high rates some frames may be silently dropped from the
+dump output without affecting actual transmission.
 .TP
 .BR \-\-burst
 Enable burst mode: alternate between a high-rate and a low-rate phase,

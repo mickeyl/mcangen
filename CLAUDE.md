@@ -28,7 +28,7 @@ The binary requires `CAP_NET_RAW` or root to open raw CAN sockets.
 
 ## Architecture
 
-Single-file application: everything is in `src/main.rs` (~900 lines). No modules, no library crate.
+Single-file application: everything is in `src/main.rs` (~1900 lines). No modules, no library crate.
 
 **Sections in order:**
 
@@ -42,13 +42,16 @@ Single-file application: everything is in `src/main.rs` (~900 lines). No modules
 
 5. **UDS Flash simulation** — `TimedFrame` struct holds a CAN ID, 8-byte payload, and pre-delay in microseconds (can_id=0 means delay-only marker). ISO-TP helpers (`push_sf`, `push_nrc`, `push_multi`) build single-frame, negative response, and multi-frame (FF+FC+CFs) sequences. `gen_uds_session()` orchestrates 16 phases of a realistic ECU reprogramming session. `gen_obd_polling()` produces inter-session OBD-II traffic. `play_timed_frames()` sends the pre-generated frame list with scaled timing. `run_uds_flash()` is the top-level loop.
 
-6. **main()** — Validates args, opens socket, dispatches to either `run_uds_flash()` (early return) or the standard frame-generation loop with burst/constant/max-rate timing.
+6. **Live monitoring** — `LiveState` struct with atomic counters (`sent`, `errors`, `running`) shared between the main send loop and optional background threads. `stats_thread()` prints a `\r`-overwritten stats line to stderr every second. `dump_thread()` reads frames from a bounded `mpsc::sync_channel` and prints candump-style output to stdout; frames are dropped silently if the channel is full.
+
+7. **main()** — Validates args, opens socket, spawns optional stats/dump threads, dispatches to either `run_uds_flash()` (early return) or the standard frame-generation loop with burst/constant/max-rate timing, then joins monitoring threads.
 
 **Key design choices:**
 - UDS flash pre-generates an entire session as `Vec<TimedFrame>` then plays it back, separating generation from timing.
 - The standard mode generates and sends one frame at a time in a tight loop.
 - All CAN IDs use the raw SocketCAN u32 format (bit 31 = extended frame flag).
 - ISO-TP padding byte is 0xCC throughout.
+- Monitoring threads use relaxed atomics and try_send to avoid impacting the hot send loop.
 
 ## Dependencies
 
