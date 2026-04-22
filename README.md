@@ -70,6 +70,12 @@ Typical use cases:
   terminals, updated every second
 - **Frame dump** — `--dump` prints each sent frame to stdout in candump
   format for inspection or piping
+- **Resilient** — survives the interface vanishing and coming back
+  (admin-down, removal, USB unplug); detects controller BUS-OFF via CAN
+  error frames and pauses transmission instead of silently counting
+  phantom sends; with `--auto-restart` cycles the interface via netlink
+  to recover from BUS-OFF on drivers that lack kernel auto-restart
+  (notably `gs_usb` / candleLight / Canable v1)
 - **Minimal dependencies** — just `clap`, `libc`, `nix`, and `fastrand`
 
 ## Requirements
@@ -246,6 +252,7 @@ mcangen can0 -n 10000 -q && echo "done"
 | `--transfer-blocks N` | [UDS flash] Blocks per session (0 = random 50–150) | `0` |
 | `--no-obd` | [UDS flash] Skip OBD-II polling between sessions | off |
 | `--no-errors` | [UDS flash] Disable error injection | off |
+| `--auto-restart` | On BUS-OFF, cycle the interface via netlink to recover (needs `CAP_NET_ADMIN`) | off |
 
 ### Makefile targets
 
@@ -285,6 +292,55 @@ grant the capability to the binary:
 
 ```bash
 sudo setcap cap_net_raw+ep target/release/mcangen
+```
+
+If you also want `--auto-restart` (which calls `RTM_NEWLINK` over
+netlink to cycle the interface), grant both capabilities:
+
+```bash
+sudo setcap cap_net_admin,cap_net_raw=eip target/release/mcangen
+```
+
+Without `CAP_NET_ADMIN`, `--auto-restart` prints a one-shot warning and
+falls back to wait-mode for the rest of the run.
+
+## Resilience
+
+mcangen is designed to keep running across transient interface failures
+rather than die on the first hiccup.
+
+**Interface vanishes** (`ip link delete`, USB unplug, `ip link set …
+down`): writes start failing with `ENODEV`/`ENETDOWN`. mcangen closes
+the dead socket and reopens with exponential backoff (100 ms → 30 s
+cap), only declaring success once the interface is administratively up
+again. The stats line keeps ticking through the outage so you can see
+the gap.
+
+**Controller goes BUS-OFF**: `write()` doesn't reliably surface this —
+on many drivers frames just queue silently while no actual bus traffic
+flows. mcangen opens a second socket with `CAN_RAW_ERR_FILTER` set to
+`BUSOFF | RESTARTED`, and a background thread reads error frames from
+it. On `CAN_ERR_BUSOFF` the live stats line shows `BUS-OFF`, the send
+loop pauses (with backoff), and frames that *would* have been written
+are counted as errors instead of as phantom successes. On
+`CAN_ERR_RESTARTED` (kernel auto-restart, manual `ip link set <iface>
+type can restart`, or our own `--auto-restart`), transmission
+transparently resumes.
+
+**Recovery from BUS-OFF on uncooperative drivers**: not every CAN
+driver implements the kernel hook (`do_set_mode`) needed to honor
+`restart-ms` or the `IFLA_CAN_RESTART` netlink attribute. The
+`gs_usb` driver — used by candleLight, Canable v1, gs_usb_leonardo,
+and most cheap STM32-based USB-CAN adapters — is the notable mainline
+example. For these, the kernel cannot self-recover and `ip link set
+<iface> type can restart` returns `EOPNOTSUPP`. With `--auto-restart`
+mcangen works around this by cycling the interface itself via raw
+netlink (down → 150 ms settle → up). Repeated rapid restarts back off
+exponentially up to 60 s so a permanently bad bus can't pin the CPU.
+
+```bash
+# fire and forget — recover from BUS-OFF without operator intervention
+mcangen can0 -r 100 --auto-restart
 ```
 
 ## A note on frame counts

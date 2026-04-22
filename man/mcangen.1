@@ -1,4 +1,4 @@
-.TH MCANGEN 1 "2026-04-16" "mcangen 1.7.0" "User Commands"
+.TH MCANGEN 1 "2026-04-22" "mcangen 1.8.0" "User Commands"
 .SH NAME
 mcangen \- high-performance CAN bus frame generator
 .SH SYNOPSIS
@@ -138,6 +138,18 @@ Skip OBD-II polling traffic between UDS flash sessions.
 Disable error injection in UDS flash mode. Without this flag, the simulator
 occasionally injects busy retries (3%), security access failures (15%),
 wrong block sequence errors (2%), and response-pending delays (5%).
+.TP
+.BR \-\-auto\-restart
+On controller BUS-OFF, cycle the interface (down + up) via netlink to
+recover. Required for drivers that don't implement \fBdo_set_mode\fR
+(notably \fBgs_usb\fR / candleLight / Canable v1) — for those, the
+kernel's \fBrestart-ms\fR mechanism and the manual
+\fBip link set <iface> type can restart\fR trigger both return
+\fBEOPNOTSUPP\fR, so userland is the only place recovery can happen.
+Requires \fBCAP_NET_ADMIN\fR; on \fBEPERM\fR the flag is silently
+disabled for the rest of the run with a one-shot warning. Repeated
+rapid restarts back off exponentially up to 60\ s. See the
+\fBRESILIENCE\fR section for the full state-machine.
 .TP
 .BR \-h ", " \-\-help
 Print help message and exit.
@@ -311,6 +323,40 @@ For more sophisticated ECU simulation with custom services, security
 algorithms, and configurable identifiers, see the
 .B ECUmulator
 project.
+.SH RESILIENCE
+mcangen is designed to keep running across transient interface failures
+rather than die on the first hiccup.
+.SS Interface vanishing
+When the interface goes admin-down, is removed (\fBip link delete\fR), or
+the underlying device disappears (USB unplug), \fBwrite\fR(2) starts failing
+with \fBENODEV\fR or \fBENETDOWN\fR. mcangen closes the dead socket and
+re-opens with exponential backoff (100\ ms\ \(en\ 30\ s cap), refusing to
+declare success until the interface is administratively up again
+(\fBIFF_UP\fR via \fBgetifaddrs\fR(3)). The live stats line keeps ticking
+through the outage so the gap is visible.
+.SS BUS-OFF detection
+The CAN controller can enter the BUS-OFF error state without producing any
+visible \fBwrite\fR(2) error \(em on many drivers, frames simply queue
+silently while no actual bus traffic flows. mcangen opens a dedicated
+second socket with \fBCAN_RAW_ERR_FILTER\fR set to
+\fBCAN_ERR_BUSOFF\ |\ CAN_ERR_RESTARTED\fR, and a background thread reads
+error frames from it. On \fBCAN_ERR_BUSOFF\fR the live stats line shows
+\fBBUS-OFF\fR, the send loop pauses with backoff, and frames that
+\fIwould\fR have been written are counted as errors instead of as phantom
+successes. On \fBCAN_ERR_RESTARTED\fR (kernel auto-restart, manual
+\fBip link set <iface> type can restart\fR, or \fB\-\-auto\-restart\fR),
+transmission transparently resumes.
+.SS Auto-recovery for drivers without do_set_mode
+Not every CAN driver implements the kernel hook (\fBdo_set_mode\fR) needed
+to honor \fBrestart-ms\fR or the \fBIFLA_CAN_RESTART\fR netlink attribute.
+The \fBgs_usb\fR driver \(em used by candleLight, Canable v1, and most
+cheap STM32-based USB-CAN adapters \(em is the notable mainline example.
+For those, \fBip link set <iface> type can restart\fR returns
+\fBEOPNOTSUPP\fR and the kernel cannot self-recover. With
+\fB\-\-auto\-restart\fR, mcangen works around this by cycling the interface
+itself via raw netlink (\fBRTM_NEWLINK\fR with \fBIFF_UP\fR cleared, then
+set), with a 150\ ms settle in between. Repeated rapid restarts back off
+exponentially up to 60\ s so a permanently bad bus cannot pin the CPU.
 .SH PERMISSIONS
 Sending CAN frames requires the \fBCAP_NET_RAW\fR capability. Either run as
 root or grant the capability:
@@ -318,6 +364,15 @@ root or grant the capability:
 .RS
 .nf
 sudo setcap cap_net_raw+ep /path/to/mcangen
+.fi
+.RE
+.PP
+\fB\-\-auto\-restart\fR additionally requires \fBCAP_NET_ADMIN\fR to bring
+the interface down and back up via netlink:
+.PP
+.RS
+.nf
+sudo setcap cap_net_admin,cap_net_raw=eip /path/to/mcangen
 .fi
 .RE
 .SH EXIT STATUS

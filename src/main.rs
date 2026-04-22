@@ -14,12 +14,19 @@ const CAN_RAW: i32 = 1;
 const SIOCGIFINDEX: libc::Ioctl = 0x8933 as libc::Ioctl;
 
 const SOL_CAN_RAW: libc::c_int = 101;
+const CAN_RAW_FILTER: libc::c_int = 1;
+const CAN_RAW_ERR_FILTER: libc::c_int = 2;
 const CAN_RAW_FD_FRAMES: libc::c_int = 5;
 
 const CAN_EFF_FLAG: u32 = 0x8000_0000;
+const CAN_ERR_FLAG: u32 = 0x2000_0000;
 const CAN_SFF_MASK: u32 = 0x0000_07FF;
 const CAN_EFF_MASK: u32 = 0x1FFF_FFFF;
 const CAN_MAX_DLC: u8 = 8;
+
+// CAN error-frame classes (bits within can_id when CAN_ERR_FLAG is set)
+const CAN_ERR_BUSOFF: u32 = 0x0000_0040;
+const CAN_ERR_RESTARTED: u32 = 0x0000_0100;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -205,6 +212,15 @@ struct Cli {
     /// [UDS flash] Disable error injection (clean sessions only)
     #[arg(long)]
     no_errors: bool,
+
+    /// On BUS-OFF, cycle the interface (down + up) via netlink to recover.
+    /// Needed for drivers that don't implement do_set_mode (notably gs_usb /
+    /// candleLight / Canable v1) — for those, restart-ms and the manual
+    /// `ip link … type can restart` trigger both return EOPNOTSUPP, so the
+    /// kernel cannot self-recover. Requires CAP_NET_ADMIN; on EPERM the flag
+    /// is silently disabled with a one-shot warning.
+    #[arg(long)]
+    auto_restart: bool,
 }
 
 fn parse_hex_u32(s: &str) -> Result<u32, String> {
@@ -281,6 +297,86 @@ fn open_can_socket(ifname: &str) -> io::Result<i32> {
     }
 }
 
+/// Open a CAN_RAW socket configured for error-frame monitoring only: the
+/// normal RX filter is cleared (no classic frames delivered, so the kernel
+/// receive buffer can't back up) and the error filter enables BUSOFF and
+/// RESTARTED notifications. A 1s SO_RCVTIMEO lets the monitor thread wake up
+/// periodically to re-check the shutdown flag.
+fn open_err_socket(ifname: &str) -> io::Result<i32> {
+    unsafe {
+        let fd = libc::socket(PF_CAN, libc::SOCK_RAW, CAN_RAW);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut ifr: Ifreq = mem::zeroed();
+        let name_bytes = ifname.as_bytes();
+        if name_bytes.len() >= libc::IFNAMSIZ {
+            libc::close(fd);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "interface name too long",
+            ));
+        }
+        ifr.ifr_name[..name_bytes.len()].copy_from_slice(name_bytes);
+
+        if libc::ioctl(fd, SIOCGIFINDEX, &mut ifr as *mut Ifreq) < 0 {
+            let e = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
+        }
+
+        // Drop all normal frames — we only care about error frames here.
+        if libc::setsockopt(fd, SOL_CAN_RAW, CAN_RAW_FILTER, std::ptr::null(), 0) < 0 {
+            let e = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
+        }
+
+        let err_mask: u32 = CAN_ERR_BUSOFF | CAN_ERR_RESTARTED;
+        if libc::setsockopt(
+            fd,
+            SOL_CAN_RAW,
+            CAN_RAW_ERR_FILTER,
+            &err_mask as *const u32 as *const libc::c_void,
+            mem::size_of::<u32>() as libc::socklen_t,
+        ) < 0
+        {
+            let e = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
+        }
+
+        let timeout = libc::timeval {
+            tv_sec: 1,
+            tv_usec: 0,
+        };
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &timeout as *const libc::timeval as *const libc::c_void,
+            mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+
+        let mut addr: SockaddrCan = mem::zeroed();
+        addr.can_family = AF_CAN as libc::sa_family_t;
+        addr.can_ifindex = ifr.ifr_ifindex;
+        if libc::bind(
+            fd,
+            &addr as *const SockaddrCan as *const libc::sockaddr,
+            mem::size_of::<SockaddrCan>() as libc::socklen_t,
+        ) < 0
+        {
+            let e = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
+        }
+
+        Ok(fd)
+    }
+}
+
 const BATCH_SIZE: usize = 64;
 
 /// Send multiple CAN frames in a single syscall using sendmmsg.
@@ -326,6 +422,244 @@ fn send_frame(fd: i32, frame: &CanFrame) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+// ── Interface vanishing / reconnect ────────────────────────────────────────
+
+/// Errors that indicate the CAN interface has gone away (admin-down, removed,
+/// or otherwise unreachable). ENOBUFS is intentionally NOT included — it just
+/// means the kernel send queue is full on a busy bus.
+#[inline]
+fn is_iface_down_err(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(code) if code == libc::ENETDOWN
+            || code == libc::ENODEV
+            || code == libc::ENXIO
+            || code == libc::ENETUNREACH
+    )
+}
+
+/// Check whether the named interface is administratively up. Returns `None`
+/// if the interface is not known to the kernel (yet). A CAN controller in
+/// BUS-OFF state is still `IFF_UP` — that case is caught separately by the
+/// error-frame monitor.
+fn iface_is_up(ifname: &str) -> Option<bool> {
+    use nix::ifaddrs::getifaddrs;
+    use nix::net::if_::InterfaceFlags;
+
+    let addrs = getifaddrs().ok()?;
+    let mut seen = false;
+    for a in addrs {
+        if a.interface_name == ifname {
+            seen = true;
+            if a.flags.contains(InterfaceFlags::IFF_UP) {
+                return Some(true);
+            }
+        }
+    }
+    if seen { Some(false) } else { None }
+}
+
+/// Close the dead fd and keep retrying `open_can_socket()` with exponential
+/// backoff (100ms → 30s cap). Updates `*fd` in place. After each successful
+/// open the interface's `IFF_UP` flag is rechecked; if the interface exists
+/// but is administratively down, the new fd is discarded and we keep backing
+/// off. This prevents a tight loop when `ip link set <iface> down` leaves the
+/// device resolvable but unusable. Note: classic CAN frames are sent here
+/// regardless of whether the new interface is FD-capable, so a non-FD return
+/// on reattach is intentionally tolerated.
+fn reconnect_socket(fd: &mut i32, ifname: &str, quiet: bool) {
+    unsafe {
+        libc::close(*fd);
+    }
+    *fd = -1;
+
+    if !quiet {
+        eprintln!(
+            "\nmcangen: interface '{}' is gone — reattaching with backoff…",
+            ifname
+        );
+    }
+
+    let mut delay = Duration::from_millis(100);
+    let max_delay = Duration::from_secs(30);
+    let outage_start = Instant::now();
+    let mut attempts: u32 = 0;
+
+    loop {
+        attempts += 1;
+        match open_can_socket(ifname) {
+            Ok(new_fd) => {
+                // Even if open succeeds, refuse to declare victory while the
+                // iface is admin-down — writes would fail immediately and we
+                // would spin.
+                if iface_is_up(ifname) != Some(true) {
+                    unsafe {
+                        libc::close(new_fd);
+                    }
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(max_delay);
+                    continue;
+                }
+                if !quiet {
+                    eprintln!(
+                        "mcangen: interface '{}' back after {:.1}s ({} attempt{}) — resuming",
+                        ifname,
+                        outage_start.elapsed().as_secs_f64(),
+                        attempts,
+                        if attempts == 1 { "" } else { "s" },
+                    );
+                }
+                *fd = new_fd;
+                return;
+            }
+            Err(_) => {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(max_delay);
+            }
+        }
+    }
+}
+
+// ── Netlink: cycle the interface to recover from BUS-OFF ──────────────────
+
+/// Resolve an interface name to its kernel ifindex.
+fn if_nametoindex(ifname: &str) -> io::Result<u32> {
+    let cstr = std::ffi::CString::new(ifname)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface name has nul byte"))?;
+    let idx = unsafe { libc::if_nametoindex(cstr.as_ptr()) };
+    if idx == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(idx)
+    }
+}
+
+/// Send an RTM_NEWLINK request that toggles only the IFF_UP bit on `ifindex`,
+/// and synchronously parse the kernel's NLMSG_ERROR ack. Returns:
+///   - `Ok(())` on success (kernel returned error=0).
+///   - `Err(EPERM)` when CAP_NET_ADMIN is missing.
+///   - other `io::Error` for transport failures or kernel errors.
+fn nl_set_iface_up(ifindex: u32, up: bool) -> io::Result<()> {
+    unsafe {
+        let fd = libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        );
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // Bind locally — kernel auto-assigns nl_pid since we leave it 0.
+        let mut local: libc::sockaddr_nl = mem::zeroed();
+        local.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        if libc::bind(
+            fd,
+            &local as *const libc::sockaddr_nl as *const libc::sockaddr,
+            mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        ) < 0
+        {
+            let e = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
+        }
+
+        // Build the request: nlmsghdr + ifinfomsg, no attributes.
+        let hdr_len = mem::size_of::<libc::nlmsghdr>();
+        let info_len = mem::size_of::<libc::ifinfomsg>();
+        let total_len = hdr_len + info_len;
+
+        let mut buf = [0u8; 64];
+        let hdr = libc::nlmsghdr {
+            nlmsg_len: total_len as u32,
+            nlmsg_type: libc::RTM_NEWLINK,
+            nlmsg_flags: (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
+            nlmsg_seq: 1,
+            nlmsg_pid: 0,
+        };
+        std::ptr::write_unaligned(buf.as_mut_ptr() as *mut libc::nlmsghdr, hdr);
+
+        let mut info: libc::ifinfomsg = mem::zeroed();
+        info.ifi_family = libc::AF_UNSPEC as u8;
+        info.ifi_index = ifindex as libc::c_int;
+        info.ifi_flags = if up { libc::IFF_UP as libc::c_uint } else { 0 };
+        info.ifi_change = libc::IFF_UP as libc::c_uint;
+        std::ptr::write_unaligned(
+            buf.as_mut_ptr().add(hdr_len) as *mut libc::ifinfomsg,
+            info,
+        );
+
+        let mut kernel: libc::sockaddr_nl = mem::zeroed();
+        kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        // nl_pid = 0 → kernel; nl_groups = 0 → unicast
+
+        let n = libc::sendto(
+            fd,
+            buf.as_ptr() as *const libc::c_void,
+            total_len,
+            0,
+            &kernel as *const libc::sockaddr_nl as *const libc::sockaddr,
+            mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        );
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
+        }
+
+        let mut rbuf = [0u8; 4096];
+        let n = libc::recv(
+            fd,
+            rbuf.as_mut_ptr() as *mut libc::c_void,
+            rbuf.len(),
+            0,
+        );
+        let recv_err = if n < 0 {
+            Some(io::Error::last_os_error())
+        } else {
+            None
+        };
+        libc::close(fd);
+        if let Some(e) = recv_err {
+            return Err(e);
+        }
+
+        let n = n as usize;
+        if n < hdr_len {
+            return Err(io::Error::other("netlink response shorter than nlmsghdr"));
+        }
+        let resp = std::ptr::read_unaligned(rbuf.as_ptr() as *const libc::nlmsghdr);
+        if i32::from(resp.nlmsg_type) != libc::NLMSG_ERROR {
+            return Err(io::Error::other(format!(
+                "unexpected netlink response type {}",
+                resp.nlmsg_type
+            )));
+        }
+        if n < hdr_len + mem::size_of::<i32>() {
+            return Err(io::Error::other("netlink error response truncated"));
+        }
+        // First field of nlmsgerr is `int error` — negative errno on failure, 0 on ack.
+        let err_code = std::ptr::read_unaligned(rbuf.as_ptr().add(hdr_len) as *const i32);
+        if err_code == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(-err_code))
+        }
+    }
+}
+
+/// Bring the interface down, briefly settle, then bring it back up. For
+/// gs_usb-class drivers this is the only way to reset the controller after
+/// BUS-OFF; the kernel can't do it because there is no `do_set_mode`.
+fn cycle_iface(ifname: &str) -> io::Result<()> {
+    let ifindex = if_nametoindex(ifname)?;
+    nl_set_iface_up(ifindex, false)?;
+    // Give the driver a moment to tear the device down before re-arming. 150ms
+    // is generous for USB; locally-bussed CAN controllers settle even faster.
+    std::thread::sleep(Duration::from_millis(150));
+    nl_set_iface_up(ifindex, true)
 }
 
 // ── Fast RNG (xorshift64*) ─────────────────────────────────────────────────
@@ -977,7 +1311,9 @@ fn gen_obd_polling(ecu: u32, cycles: usize, rng: &mut Rng) -> Vec<TimedFrame> {
 // ── Frame playback ────────────────────────────────────────────────────────
 
 fn play_timed_frames(
-    fd: i32,
+    fd: &mut i32,
+    ifname: &str,
+    quiet: bool,
     frames: &[TimedFrame],
     speed: f64,
     live: &LiveState,
@@ -988,6 +1324,13 @@ fn play_timed_frames(
     let mut next = Instant::now();
 
     for tf in frames {
+        if live.bus_off.load(Ordering::Relaxed) {
+            errs += 1;
+            live.errors.store(errs, Ordering::Relaxed);
+            wait_while_bus_off(live);
+            next = Instant::now();
+        }
+
         let us = (tf.pre_delay_us as f64 / speed) as u64;
         next += Duration::from_micros(us);
         wait_until(next);
@@ -1004,7 +1347,7 @@ fn play_timed_frames(
             __res1: 0,
             data: tf.data,
         };
-        match send_frame(fd, &frame) {
+        match send_frame(*fd, &frame) {
             Ok(()) => {
                 sent += 1;
                 live.sent.store(sent, Ordering::Relaxed);
@@ -1015,7 +1358,10 @@ fn play_timed_frames(
             Err(e) => {
                 errs += 1;
                 live.errors.store(errs, Ordering::Relaxed);
-                if errs <= 3 {
+                if is_iface_down_err(&e) {
+                    reconnect_socket(fd, ifname, quiet);
+                    next = Instant::now();
+                } else if errs <= 3 {
                     eprintln!("warning: write failed: {}", e);
                 }
             }
@@ -1027,7 +1373,7 @@ fn play_timed_frames(
 // ── UDS Flash runner ──────────────────────────────────────────────────────
 
 fn run_uds_flash(
-    fd: i32,
+    fd: &mut i32,
     cli: &Cli,
     live: &LiveState,
     dump_tx: &Option<mpsc::SyncSender<CanFrame>>,
@@ -1072,7 +1418,15 @@ fn run_uds_flash(
 
         let uds_frames = gen_uds_session(tester, ecu, num_blocks, errors, &mut rng);
         let s_start = Instant::now();
-        let (sent, errs) = play_timed_frames(fd, &uds_frames, speed, live, dump_tx);
+        let (sent, errs) = play_timed_frames(
+            fd,
+            &cli.interface,
+            cli.quiet,
+            &uds_frames,
+            speed,
+            live,
+            dump_tx,
+        );
         total_sent += sent;
         total_errs += errs;
 
@@ -1090,7 +1444,15 @@ fn run_uds_flash(
         if !cli.no_obd && (unlimited || sessions < cli.count) {
             let obd_cycles = rng.range_u32(15, 30) as usize;
             let obd_frames = gen_obd_polling(ecu, obd_cycles, &mut rng);
-            let (s, e) = play_timed_frames(fd, &obd_frames, speed, live, dump_tx);
+            let (s, e) = play_timed_frames(
+                fd,
+                &cli.interface,
+                cli.quiet,
+                &obd_frames,
+                speed,
+                live,
+                dump_tx,
+            );
             total_sent += s;
             total_errs += e;
 
@@ -1113,6 +1475,7 @@ fn run_uds_flash(
 struct LiveState {
     sent: AtomicU64,
     errors: AtomicU64,
+    bus_off: AtomicBool,
     running: AtomicBool,
 }
 
@@ -1121,9 +1484,198 @@ impl LiveState {
         Arc::new(Self {
             sent: AtomicU64::new(0),
             errors: AtomicU64::new(0),
+            bus_off: AtomicBool::new(false),
             running: AtomicBool::new(true),
         })
     }
+}
+
+/// Close the monitor socket and reopen it once the iface is admin-up again,
+/// with the same 100ms→30s backoff as the send-path reconnect. Returns
+/// `false` if the run was asked to stop while we were waiting.
+fn err_socket_reopen(fd: &mut i32, ifname: &str, state: &LiveState) -> bool {
+    unsafe {
+        libc::close(*fd);
+    }
+    *fd = -1;
+    let mut delay = Duration::from_millis(100);
+    let max_delay = Duration::from_secs(30);
+    loop {
+        if !state.running.load(Ordering::Relaxed) {
+            return false;
+        }
+        match open_err_socket(ifname) {
+            Ok(nfd) if iface_is_up(ifname) == Some(true) => {
+                *fd = nfd;
+                return true;
+            }
+            Ok(nfd) => unsafe {
+                libc::close(nfd);
+            },
+            Err(_) => {}
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(max_delay);
+    }
+}
+
+/// Watches the CAN controller state by reading error frames from a dedicated
+/// socket. Flips `state.bus_off` on CAN_ERR_BUSOFF / CAN_ERR_RESTARTED.
+/// Self-heals across interface outages (close + reopen with the same
+/// 100ms→30s backoff as the send path). On a successful reopen we
+/// optimistically clear `bus_off` — if the controller is still off we will
+/// re-receive the BUSOFF error frame and flip it back on.
+///
+/// When `auto_restart` is set, BUS-OFF triggers a netlink down/up cycle of
+/// the iface (working around drivers that don't implement do_set_mode, e.g.
+/// gs_usb). On EPERM the flag is disabled for the rest of the run with a
+/// one-shot warning. Repeated rapid restarts back off exponentially so a
+/// permanently bad bus can't pin the CPU.
+fn err_monitor_thread(state: Arc<LiveState>, ifname: String, quiet: bool, auto_restart: bool) {
+    let mut fd = match open_err_socket(&ifname) {
+        Ok(fd) => fd,
+        Err(e) => {
+            if !quiet {
+                eprintln!(
+                    "warning: bus-state monitor disabled for '{}' ({}) — BUS-OFF will not be detected",
+                    ifname, e,
+                );
+            }
+            return;
+        }
+    };
+
+    let mut auto_restart = auto_restart;
+    let mut next_restart_delay = Duration::from_millis(200);
+    let mut last_restart_time: Option<Instant> = None;
+
+    let mut frame: CanFrame = unsafe { mem::zeroed() };
+    while state.running.load(Ordering::Relaxed) {
+        let n = unsafe {
+            libc::read(
+                fd,
+                &mut frame as *mut CanFrame as *mut libc::c_void,
+                mem::size_of::<CanFrame>(),
+            )
+        };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK || code == libc::EINTR => {
+                    continue;
+                }
+                _ => {}
+            }
+            if is_iface_down_err(&e) {
+                state.bus_off.store(false, Ordering::Relaxed);
+                if !err_socket_reopen(&mut fd, &ifname, &state) {
+                    return;
+                }
+                continue;
+            }
+            if !quiet {
+                eprintln!("warning: bus-state monitor terminated — {}", e);
+            }
+            break;
+        }
+
+        if (n as usize) < mem::size_of::<CanFrame>() {
+            continue;
+        }
+        if frame.can_id & CAN_ERR_FLAG == 0 {
+            // RX filter is empty so this shouldn't happen, but ignore if it does.
+            continue;
+        }
+        let err_class = frame.can_id & !CAN_ERR_FLAG;
+        if err_class & CAN_ERR_BUSOFF != 0 {
+            let was_off = state.bus_off.swap(true, Ordering::Relaxed);
+            if !was_off && !quiet {
+                let suffix = if auto_restart {
+                    " (--auto-restart will cycle the interface)"
+                } else {
+                    " (recover with: ip link set <iface> type can restart, or set restart-ms > 0)"
+                };
+                eprintln!(
+                    "\nmcangen: BUS-OFF on '{}' — pausing transmission{}",
+                    ifname, suffix,
+                );
+            }
+
+            if auto_restart {
+                // Adaptive backoff: if the previous restart was long enough
+                // ago, treat this as a fresh event; otherwise keep doubling.
+                let now = Instant::now();
+                match last_restart_time {
+                    Some(t) if now.duration_since(t) < Duration::from_secs(30) => {
+                        next_restart_delay = (next_restart_delay * 2).min(Duration::from_secs(60));
+                    }
+                    _ => {
+                        next_restart_delay = Duration::from_millis(200);
+                    }
+                }
+                std::thread::sleep(next_restart_delay);
+                last_restart_time = Some(Instant::now());
+
+                match cycle_iface(&ifname) {
+                    Ok(()) => {
+                        if !quiet {
+                            eprintln!(
+                                "mcangen: cycled '{}' via netlink — re-attaching",
+                                ifname
+                            );
+                        }
+                        // The iface bounce invalidates our monitor socket.
+                        // Re-open via the standard reopen helper, which also
+                        // waits for IFF_UP. Optimistically clear bus_off; if
+                        // the bus is still bad we'll get another BUSOFF frame
+                        // shortly and flip back.
+                        state.bus_off.store(false, Ordering::Relaxed);
+                        if !err_socket_reopen(&mut fd, &ifname, &state) {
+                            return;
+                        }
+                    }
+                    Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
+                        if !quiet {
+                            eprintln!(
+                                "mcangen: --auto-restart needs CAP_NET_ADMIN; disabling for this run (try: sudo setcap cap_net_admin,cap_net_raw=eip <mcangen-binary>)"
+                            );
+                        }
+                        auto_restart = false;
+                    }
+                    Err(e) => {
+                        if !quiet {
+                            eprintln!(
+                                "mcangen: --auto-restart cycle of '{}' failed: {}",
+                                ifname, e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if err_class & CAN_ERR_RESTARTED != 0 && state.bus_off.swap(false, Ordering::Relaxed) && !quiet {
+            eprintln!("\nmcangen: bus restarted on '{}' — resuming", ifname);
+        }
+    }
+    unsafe {
+        libc::close(fd);
+    }
+}
+
+/// Block while `state.bus_off` is set, using a short exponential backoff
+/// (100ms → 5s). Returns `true` if we actually waited (caller should reset
+/// rate-limit baselines), `false` if the bus was online from the start.
+fn wait_while_bus_off(state: &LiveState) -> bool {
+    if !state.bus_off.load(Ordering::Relaxed) {
+        return false;
+    }
+    let mut delay = Duration::from_millis(100);
+    let max_delay = Duration::from_secs(5);
+    while state.bus_off.load(Ordering::Relaxed) && state.running.load(Ordering::Relaxed) {
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(max_delay);
+    }
+    true
 }
 
 fn stats_thread(state: Arc<LiveState>, interface: String) {
@@ -1146,9 +1698,14 @@ fn stats_thread(state: Arc<LiveState>, interface: String) {
         };
         prev_sent = sent;
 
+        let state_tag = if state.bus_off.load(Ordering::Relaxed) {
+            " | BUS-OFF"
+        } else {
+            ""
+        };
         eprint!(
-            "\r{}: {} frames | {:.0} fps (avg {:.0}) | {} err | {:.1}s    ",
-            interface, sent, instant_fps, avg_fps, errors, elapsed,
+            "\r{}: {} frames | {:.0} fps (avg {:.0}) | {} err | {:.1}s{}    ",
+            interface, sent, instant_fps, avg_fps, errors, elapsed, state_tag,
         );
     }
     eprintln!();
@@ -1260,7 +1817,7 @@ fn main() {
     let unlimited = cli.count == 0;
     let max_rate = cli.fps == 0;
 
-    let fd = open_can_socket(&cli.interface).unwrap_or_else(|e| {
+    let mut fd = open_can_socket(&cli.interface).unwrap_or_else(|e| {
         eprintln!(
             "error: failed to open CAN socket on '{}': {}",
             cli.interface, e
@@ -1271,6 +1828,21 @@ fn main() {
 
     // ── Live monitoring threads ──
     let live = LiveState::new();
+
+    // Bus-state monitor: listens for CAN error frames so we know when the
+    // controller goes BUS-OFF (which is invisible to write()).
+    let err_monitor_handle = {
+        let s = Arc::clone(&live);
+        let iface = cli.interface.clone();
+        let quiet = cli.quiet;
+        let auto_restart = cli.auto_restart;
+        Some(
+            std::thread::Builder::new()
+                .name("can-err".into())
+                .spawn(move || err_monitor_thread(s, iface, quiet, auto_restart))
+                .unwrap(),
+        )
+    };
 
     let show_stats = !cli.quiet && !cli.dump && unsafe { libc::isatty(libc::STDERR_FILENO) == 1 };
     let stats_handle = if show_stats {
@@ -1299,10 +1871,13 @@ fn main() {
     };
 
     if cli.uds_flash {
-        run_uds_flash(fd, &cli, &live, &dump_tx);
+        run_uds_flash(&mut fd, &cli, &live, &dump_tx);
         live.running.store(false, Ordering::Relaxed);
         drop(dump_tx);
         if let Some(h) = stats_handle {
+            let _ = h.join();
+        }
+        if let Some(h) = err_monitor_handle {
             let _ = h.join();
         }
         unsafe {
@@ -1377,6 +1952,15 @@ fn main() {
         let mut batch: [CanFrame; BATCH_SIZE] = [frame; BATCH_SIZE];
 
         'max_rate: loop {
+            if live.bus_off.load(Ordering::Relaxed) {
+                // Frames sent while BUS-OFF wouldn't reach the wire — pause
+                // and count an error rather than lying about throughput.
+                errors += 1;
+                live.errors.store(errors, Ordering::Relaxed);
+                wait_while_bus_off(&live);
+                continue;
+            }
+
             // Fill a batch of frames
             let batch_count = if unlimited {
                 BATCH_SIZE
@@ -1451,7 +2035,14 @@ fn main() {
                     }
                 }
                 Err(e) => {
+                    if is_iface_down_err(&e) {
+                        errors += 1;
+                        live.errors.store(errors, Ordering::Relaxed);
+                        reconnect_socket(&mut fd, &cli.interface, cli.quiet);
+                        continue;
+                    }
                     // Fallback: send individually on batch failure
+                    let mut iface_lost = false;
                     for f in &batch[..batch_count] {
                         match send_frame(fd, f) {
                             Ok(()) => {
@@ -1464,12 +2055,20 @@ fn main() {
                             Err(e) => {
                                 errors += 1;
                                 live.errors.store(errors, Ordering::Relaxed);
+                                if is_iface_down_err(&e) {
+                                    reconnect_socket(&mut fd, &cli.interface, cli.quiet);
+                                    iface_lost = true;
+                                    break;
+                                }
                                 if e.raw_os_error() != Some(libc::ENOBUFS) && errors > 100 {
                                     eprintln!("error: too many write errors, aborting");
                                     break 'max_rate;
                                 }
                             }
                         }
+                    }
+                    if iface_lost {
+                        continue;
                     }
                     if errors <= 5 {
                         eprintln!("warning: sendmmsg failed, falling back: {}", e);
@@ -1495,6 +2094,17 @@ fn main() {
         loop {
             if !unlimited && sent >= cli.count {
                 break;
+            }
+
+            if live.bus_off.load(Ordering::Relaxed) {
+                errors += 1;
+                live.errors.store(errors, Ordering::Relaxed);
+                wait_while_bus_off(&live);
+                next_send = Instant::now();
+                if cli.burst {
+                    burst_phase_start = next_send;
+                }
+                continue;
             }
 
             // ── ID ──
@@ -1605,16 +2215,25 @@ fn main() {
                 Err(e) => {
                     errors += 1;
                     live.errors.store(errors, Ordering::Relaxed);
-                    if errors <= 5 {
-                        eprintln!("warning: write failed: {}", e);
-                    }
-                    if errors == 5 {
-                        eprintln!("warning: suppressing further write errors");
-                    }
-                    // ENOBUFS is transient on busy interfaces — keep going
-                    if e.raw_os_error() != Some(libc::ENOBUFS) && errors > 100 {
-                        eprintln!("error: too many write errors, aborting");
-                        break;
+                    if is_iface_down_err(&e) {
+                        reconnect_socket(&mut fd, &cli.interface, cli.quiet);
+                        // Reset rate-limit baselines so we don't catch up missed frames
+                        next_send = Instant::now();
+                        if cli.burst {
+                            burst_phase_start = next_send;
+                        }
+                    } else {
+                        if errors <= 5 {
+                            eprintln!("warning: write failed: {}", e);
+                        }
+                        if errors == 5 {
+                            eprintln!("warning: suppressing further write errors");
+                        }
+                        // ENOBUFS is transient on busy interfaces — keep going
+                        if e.raw_os_error() != Some(libc::ENOBUFS) && errors > 100 {
+                            eprintln!("error: too many write errors, aborting");
+                            break;
+                        }
                     }
                 }
             }
@@ -1637,6 +2256,9 @@ fn main() {
     live.running.store(false, Ordering::Relaxed);
     drop(dump_tx);
     if let Some(h) = stats_handle {
+        let _ = h.join();
+    }
+    if let Some(h) = err_monitor_handle {
         let _ = h.join();
     }
 
