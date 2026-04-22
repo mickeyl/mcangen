@@ -1,4 +1,4 @@
-.TH MCANGEN 1 "2026-04-22" "mcangen 1.8.0" "User Commands"
+.TH MCANGEN 1 "2026-04-22" "mcangen 1.9.0" "User Commands"
 .SH NAME
 mcangen \- high-performance CAN bus frame generator
 .SH SYNOPSIS
@@ -73,7 +73,7 @@ summary (default: \fB0\fR).
 .BR \-q ", " \-\-quiet
 Suppress all output except errors.
 .TP
-.BR \-\-dump
+.BR \-v ", " \-\-dump
 Dump each sent frame to stdout in candump format. Uses a bounded internal
 buffer; at very high rates some frames may be silently dropped from the
 dump output without affecting actual transmission. Disables the live stats
@@ -357,6 +357,14 @@ For those, \fBip link set <iface> type can restart\fR returns
 itself via raw netlink (\fBRTM_NEWLINK\fR with \fBIFF_UP\fR cleared, then
 set), with a 150\ ms settle in between. Repeated rapid restarts back off
 exponentially up to 60\ s so a permanently bad bus cannot pin the CPU.
+.SS Startup BUS-OFF recovery
+On startup, mcangen queries the CAN controller state via \fBRTM_GETLINK\fR
+(walking \fBIFLA_LINKINFO\fR \(-> \fBIFLA_INFO_DATA\fR \(->
+\fBIFLA_CAN_STATE\fR); if it is already \fBCAN_STATE_BUS_OFF\fR the
+interface is cycled once before the send socket is opened so the user does
+not have to poke \fBip link\fR first. This one-shot recovery is independent
+of \fB\-\-auto\-restart\fR (which gates continuous runtime recovery) but
+also needs \fBCAP_NET_ADMIN\fR; on \fBEPERM\fR mcangen warns and continues.
 .SH PERMISSIONS
 Sending CAN frames requires the \fBCAP_NET_RAW\fR capability. Either run as
 root or grant the capability:

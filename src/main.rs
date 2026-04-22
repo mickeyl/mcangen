@@ -155,7 +155,7 @@ struct Cli {
     quiet: bool,
 
     /// Dump sent frames to stdout in candump format
-    #[arg(long)]
+    #[arg(short = 'v', long)]
     dump: bool,
 
     /// Enable burst mode: alternate between high-rate and low-rate periods (emulates ECU reprogramming)
@@ -660,6 +660,180 @@ fn cycle_iface(ifname: &str) -> io::Result<()> {
     // is generous for USB; locally-bussed CAN controllers settle even faster.
     std::thread::sleep(Duration::from_millis(150));
     nl_set_iface_up(ifindex, true)
+}
+
+// ── Netlink: read the CAN controller state ────────────────────────────────
+
+const IFLA_LINKINFO: u16 = 18;
+const IFLA_INFO_KIND: u16 = 1;
+const IFLA_INFO_DATA: u16 = 2;
+const IFLA_CAN_STATE: u16 = 4;
+const NLA_TYPE_MASK: u16 = 0x3fff;
+
+// From linux/can/netlink.h — enum can_state.
+const CAN_STATE_BUS_OFF: u32 = 3;
+
+#[inline]
+fn nla_align(len: usize) -> usize {
+    (len + 3) & !3
+}
+
+/// Find the first netlink attribute with the given type in a TLV blob.
+/// Each nlattr is `u16 nla_len` (incl. 4-byte header) + `u16 nla_type` +
+/// payload + padding to 4 bytes. The type may carry NLA_F_NESTED /
+/// NLA_F_NET_BYTEORDER flags, so compare against NLA_TYPE_MASK.
+fn nl_find_attr(buf: &[u8], nla_type: u16) -> Option<&[u8]> {
+    let mut off = 0;
+    while off + 4 <= buf.len() {
+        let nla_len =
+            u16::from_ne_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        let ty = u16::from_ne_bytes(buf[off + 2..off + 4].try_into().unwrap())
+            & NLA_TYPE_MASK;
+        if nla_len < 4 || off + nla_len > buf.len() {
+            break;
+        }
+        if ty == nla_type {
+            return Some(&buf[off + 4..off + nla_len]);
+        }
+        off += nla_align(nla_len);
+    }
+    None
+}
+
+/// Query the CAN controller state via RTM_GETLINK, walking the nested
+/// IFLA_LINKINFO → IFLA_INFO_DATA → IFLA_CAN_STATE attributes. Returns
+/// `Ok(None)` when the interface exists but is not a CAN device (or the
+/// driver does not expose a state), `Err` for netlink transport failures.
+fn get_can_state(ifindex: u32) -> io::Result<Option<u32>> {
+    unsafe {
+        let fd = libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        );
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut local: libc::sockaddr_nl = mem::zeroed();
+        local.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        if libc::bind(
+            fd,
+            &local as *const libc::sockaddr_nl as *const libc::sockaddr,
+            mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        ) < 0
+        {
+            let e = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
+        }
+
+        let hdr_len = mem::size_of::<libc::nlmsghdr>();
+        let info_len = mem::size_of::<libc::ifinfomsg>();
+        let total_len = hdr_len + info_len;
+
+        let mut sbuf = [0u8; 64];
+        let hdr = libc::nlmsghdr {
+            nlmsg_len: total_len as u32,
+            nlmsg_type: libc::RTM_GETLINK,
+            nlmsg_flags: libc::NLM_F_REQUEST as u16,
+            nlmsg_seq: 1,
+            nlmsg_pid: 0,
+        };
+        std::ptr::write_unaligned(sbuf.as_mut_ptr() as *mut libc::nlmsghdr, hdr);
+
+        let mut info: libc::ifinfomsg = mem::zeroed();
+        info.ifi_family = libc::AF_UNSPEC as u8;
+        info.ifi_index = ifindex as libc::c_int;
+        std::ptr::write_unaligned(
+            sbuf.as_mut_ptr().add(hdr_len) as *mut libc::ifinfomsg,
+            info,
+        );
+
+        let mut kernel: libc::sockaddr_nl = mem::zeroed();
+        kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+
+        let n = libc::sendto(
+            fd,
+            sbuf.as_ptr() as *const libc::c_void,
+            total_len,
+            0,
+            &kernel as *const libc::sockaddr_nl as *const libc::sockaddr,
+            mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        );
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
+        }
+
+        let mut rbuf = vec![0u8; 8192];
+        let n = libc::recv(
+            fd,
+            rbuf.as_mut_ptr() as *mut libc::c_void,
+            rbuf.len(),
+            0,
+        );
+        let recv_err = if n < 0 {
+            Some(io::Error::last_os_error())
+        } else {
+            None
+        };
+        libc::close(fd);
+        if let Some(e) = recv_err {
+            return Err(e);
+        }
+
+        let n = n as usize;
+        if n < hdr_len {
+            return Err(io::Error::other("netlink response shorter than nlmsghdr"));
+        }
+        let resp = std::ptr::read_unaligned(rbuf.as_ptr() as *const libc::nlmsghdr);
+
+        if i32::from(resp.nlmsg_type) == libc::NLMSG_ERROR {
+            if n < hdr_len + mem::size_of::<i32>() {
+                return Err(io::Error::other("netlink error response truncated"));
+            }
+            let err_code =
+                std::ptr::read_unaligned(rbuf.as_ptr().add(hdr_len) as *const i32);
+            if err_code == 0 {
+                return Ok(None);
+            }
+            return Err(io::Error::from_raw_os_error(-err_code));
+        }
+        if resp.nlmsg_type != libc::RTM_NEWLINK {
+            return Err(io::Error::other(format!(
+                "unexpected netlink response type {}",
+                resp.nlmsg_type
+            )));
+        }
+
+        let msg_len = resp.nlmsg_len as usize;
+        if msg_len > n || msg_len < hdr_len + info_len {
+            return Err(io::Error::other("netlink message truncated"));
+        }
+        let attrs = &rbuf[hdr_len + info_len..msg_len];
+
+        if let Some(linkinfo) = nl_find_attr(attrs, IFLA_LINKINFO) {
+            // Only trust IFLA_INFO_DATA when the kind is actually "can".
+            let is_can = nl_find_attr(linkinfo, IFLA_INFO_KIND)
+                .map(|k| k.split(|&b| b == 0).next() == Some(b"can"))
+                .unwrap_or(false);
+            if is_can {
+                if let Some(info_data) = nl_find_attr(linkinfo, IFLA_INFO_DATA) {
+                    if let Some(state_attr) = nl_find_attr(info_data, IFLA_CAN_STATE) {
+                        if state_attr.len() >= 4 {
+                            let state = u32::from_ne_bytes(
+                                state_attr[..4].try_into().unwrap(),
+                            );
+                            return Ok(Some(state));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 // ── Fast RNG (xorshift64*) ─────────────────────────────────────────────────
@@ -1816,6 +1990,39 @@ fn main() {
 
     let unlimited = cli.count == 0;
     let max_rate = cli.fps == 0;
+
+    // If the controller is already stuck in BUS-OFF, try to recover before we
+    // even open the send socket — otherwise every frame we queue just piles up
+    // in the driver with no hope of reaching the wire.
+    if let Ok(ifindex) = if_nametoindex(&cli.interface) {
+        if let Ok(Some(CAN_STATE_BUS_OFF)) = get_can_state(ifindex) {
+            if !cli.quiet {
+                eprintln!(
+                    "mcangen: '{}' is BUS-OFF at startup — cycling the interface to recover",
+                    cli.interface
+                );
+            }
+            match cycle_iface(&cli.interface) {
+                Ok(()) => {
+                    if !cli.quiet {
+                        eprintln!("mcangen: '{}' restarted", cli.interface);
+                    }
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
+                    eprintln!(
+                        "mcangen: '{}' is BUS-OFF and restart needs CAP_NET_ADMIN (try: sudo setcap cap_net_admin,cap_net_raw=eip <mcangen-binary>)",
+                        cli.interface,
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "mcangen: failed to restart '{}' after BUS-OFF: {} — continuing anyway",
+                        cli.interface, e,
+                    );
+                }
+            }
+        }
+    }
 
     let mut fd = open_can_socket(&cli.interface).unwrap_or_else(|e| {
         eprintln!(

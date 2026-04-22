@@ -10,6 +10,8 @@ MANDIR    ?= $(PREFIX)/share/man
 BIN       := target/release/mcangen
 SRC       := $(shell find src -name '*.rs') Cargo.toml Cargo.lock
 
+CAPS      := cap_net_admin,cap_net_raw=eip
+
 VERSION   := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 
 .PHONY: all build run blast uds-flash test clean install uninstall fmt check clippy vcan vcanfd man release publish help
@@ -20,6 +22,8 @@ build: $(BIN)
 
 $(BIN): $(SRC)
 	cargo build --release
+	@echo "Applying capabilities ($(CAPS)) — may prompt for sudo password"
+	sudo setcap $(CAPS) $(BIN)
 
 run: $(BIN)
 	./$(BIN) $(IFACE) -n $(COUNT) -r $(RATE) $(EXTRA)
@@ -63,6 +67,8 @@ man:
 install: $(BIN)
 	install -Dm755 $(BIN) $(BINDIR)/mcangen
 	install -Dm644 man/mcangen.1 $(MANDIR)/man1/mcangen.1
+	@echo "Applying capabilities ($(CAPS)) to $(BINDIR)/mcangen — may prompt for sudo password"
+	sudo setcap $(CAPS) $(BINDIR)/mcangen
 
 uninstall:
 	rm -f $(BINDIR)/mcangen
