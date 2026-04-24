@@ -89,6 +89,9 @@ release: build
 	@echo "Run 'make publish' to push to crates.io."
 
 publish:
+	@if curl -sfA "mcangen-makefile" "https://crates.io/api/v1/crates/mcangen/$(VERSION)" -o /dev/null 2>/dev/null; then \
+		echo "error: v$(VERSION) already published to crates.io — bump version in Cargo.toml"; exit 1; \
+	fi
 	cargo publish --dry-run
 	@echo ""
 	@echo "Dry run passed. Publishing v$(VERSION) to crates.io in 5s... (Ctrl-C to abort)"
