@@ -46,6 +46,29 @@ Typical use cases:
 - **Regression testing** with reproducible traffic — same seed, same
   frames every time.
 
+### End-to-end CAN diagnosis
+
+The motivating diagnostic workflow uses more than a frame counter. Linux
+generates deterministic quality traffic, a device under test validates and
+optionally relays it on another CAN ID, and `mcandump` checks the complete
+return path:
+
+```bash
+# Receiver/verifier: requests on 0x700, relay responses on 0x701
+mcandump can1 --quiet --quality-test --quality-id 0x700 \
+    --quality-response-id 0x701 --quality-test-id 1 --quality-strict
+
+# Generator: 64-byte CAN-FD+BRS frames with sequence, timestamp, pattern, CRC32C
+mcangen can1 --fd --brs --data-mode quality-test --id 0x700 \
+    --test-id 1 -r 1000 -n 30000
+```
+
+With ESPenlaub hwtest, configure the MCU side with `twai quality relay 700
+701 1`. The final report identifies missing, duplicate, reordered, corrupt,
+and kernel-dropped frames and includes request/response round-trip latency.
+Use an 8-byte Classic CAN quality stream when the controller does not support
+CAN-FD.
+
 ## Features
 
 - **Fast** — `sendmmsg()` batching in max-rate mode for reduced syscall
@@ -53,10 +76,11 @@ Typical use cases:
   CPU usage, CAN-FD capable socket, release build with LTO
 - **All frame types** — standard (11-bit) IDs, extended (29-bit) IDs, or a
   random mix of both
-- **Configurable DLC** — any range from 0 to 8 bytes
+- **Configurable payload** — 0 to 8 bytes for Classic CAN, 0 to 64 bytes
+  for CAN-FD
 - **Data patterns** — random, zeros, ones (0xFF), incrementing counter,
-  64-bit big-endian sequence number, or CANcorder quality-test protocol
-  on an exact CAN ID via `--id`
+  64-bit big-endian sequence number, or content-aware Classic/CAN-FD
+  quality-test protocols on an exact CAN ID via `--id`
 - **UDS flash simulation** — realistic ECU reprogramming session with
   proper ISO-TP framing, security access, memory erase, firmware transfer,
   DTC handling, and ECU reset — both tester and ECU sides on the bus
@@ -81,7 +105,7 @@ Typical use cases:
 ## Requirements
 
 - Linux with SocketCAN support (kernel 2.6.25+)
-- Rust toolchain 1.85+
+- Rust toolchain 1.94+
 - `CAP_NET_RAW` capability or root access
 
 ## Building
@@ -214,6 +238,19 @@ Generates frames with the 0xCAFE magic marker, 16-bit sequence number,
 CANcorder's quality test panel.
 In this mode, `--id` is required and `--id-min`/`--id-max` are rejected.
 
+**Versioned CAN-FD quality traffic with BRS:**
+
+```bash
+mcangen can1 --fd --brs --data-mode quality-test --id 0x700 \
+    --test-id 1 -r 1000 -n 30000
+```
+
+The FD quality format uses a fixed 64-byte payload with a 64-bit sequence
+number, microsecond sender clock, deterministic payload pattern, and CRC32C.
+It is understood by `mcandump --quality-test` and ESPenlaub hwtest's
+`twai quality` commands. Regular CAN-FD generation accepts payload lengths up
+to 64 bytes; lengths are rounded up to a valid CAN-FD wire length.
+
 **Quiet mode for scripting (exit code only):**
 
 ```bash
@@ -226,8 +263,10 @@ mcangen can0 -n 10000 -q && echo "done"
 |---|---|---|
 | `-n, --count N` | Number of frames to send (0 = unlimited) | `0` |
 | `-r, --rate FPS` | Target frames/sec (0 = max speed) | `5` |
-| `--dlc-min N` | Minimum DLC (0–8) | `0` |
-| `--dlc-max N` | Maximum DLC (0–8) | `8` |
+| `--dlc-min N` | Minimum payload length (0–8 classic, 0–64 FD) | `0` |
+| `--dlc-max N` | Maximum payload length (0–8 classic, 0–64 FD) | `8` |
+| `--fd` | Emit Linux `canfd_frame`s; quality-test uses the versioned 64-byte format | off |
+| `--brs` | Enable CAN-FD bitrate switching (requires `--fd`) | off |
 | `--id-min ID` | Minimum CAN ID (hex or decimal) | `0x000` |
 | `--id-max ID` | Maximum CAN ID (hex or decimal) | `0x7FF` / `0x1FFFFFFF` |
 | `--id ID` | Exact CAN ID; required for `quality-test` mode | none |
@@ -239,6 +278,7 @@ mcangen can0 -n 10000 -q && echo "done"
 | `-p, --progress N` | Print stats every N frames | `0` |
 | `-q, --quiet` | Suppress all output except errors | off |
 | `--dump` | Dump sent frames to stdout in candump format | off |
+| `--no-local-loopback` | Disable local TX echo on the generator socket (useful with controller loopback) | off |
 | `--burst` | Enable burst mode (alternating high/low rate) | off |
 | `--burst-high-rate FPS` | High-rate phase FPS | `5000` |
 | `--burst-low-rate FPS` | Low-rate phase FPS | `50` |
