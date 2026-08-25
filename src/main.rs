@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
 use std::io;
 use std::mem;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -33,8 +33,23 @@ const QUALITY_FD_HEADER_LEN: usize = 24;
 const QUALITY_FD_CRC_LEN: usize = 4;
 
 // CAN error-frame classes (bits within can_id when CAN_ERR_FLAG is set)
+const CAN_ERR_CRTL: u32 = 0x0000_0004;
+const CAN_ERR_ACK: u32 = 0x0000_0020;
 const CAN_ERR_BUSOFF: u32 = 0x0000_0040;
 const CAN_ERR_RESTARTED: u32 = 0x0000_0100;
+const CAN_ERR_CNT: u32 = 0x0000_0200;
+// CAN_ERR_CRTL details (data[1])
+const CAN_ERR_CRTL_RX_WARNING: u8 = 0x04;
+const CAN_ERR_CRTL_TX_WARNING: u8 = 0x08;
+const CAN_ERR_CRTL_RX_PASSIVE: u8 = 0x10;
+const CAN_ERR_CRTL_TX_PASSIVE: u8 = 0x20;
+const CAN_ERR_CRTL_ACTIVE: u8 = 0x40;
+
+/// Controller health as reported by CAN_ERR_CRTL frames. Stored as a u8 in
+/// `LiveState::ctrl_state`.
+const CTRL_ACTIVE: u8 = 0;
+const CTRL_WARNING: u8 = 1;
+const CTRL_PASSIVE: u8 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -78,6 +93,15 @@ struct Ifreq {
 }
 
 // ── CLI ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OnError {
+    /// Keep sending; the degraded state is only shown in the stats line
+    Continue,
+    /// Hold transmission while the controller is ERROR-PASSIVE (resume on
+    /// ERROR-ACTIVE), like the built-in BUS-OFF pause
+    Pause,
+}
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum IdMode {
@@ -259,6 +283,13 @@ struct Cli {
     /// is silently disabled with a one-shot warning.
     #[arg(long)]
     auto_restart: bool,
+
+    /// What to do while the controller is ERROR-PASSIVE (e.g. no other node
+    /// ACKs our frames). A lone node never reaches BUS-OFF -- its TX error
+    /// counter stops at 128 -- so without this the generator keeps writing
+    /// into the kernel queue and reports throughput that never hits the wire.
+    #[arg(long, value_enum, default_value_t = OnError::Continue)]
+    on_error: OnError,
 }
 
 fn parse_hex_u32(s: &str) -> Result<u32, String> {
@@ -385,7 +416,7 @@ fn open_err_socket(ifname: &str) -> io::Result<i32> {
             return Err(e);
         }
 
-        let err_mask: u32 = CAN_ERR_BUSOFF | CAN_ERR_RESTARTED;
+        let err_mask: u32 = CAN_ERR_BUSOFF | CAN_ERR_RESTARTED | CAN_ERR_CRTL | CAN_ERR_ACK;
         if libc::setsockopt(
             fd,
             SOL_CAN_RAW,
@@ -1622,7 +1653,7 @@ fn play_timed_frames(
     let mut next = Instant::now();
 
     for tf in frames {
-        if live.bus_off.load(Ordering::Relaxed) {
+        if live.should_hold() {
             errs += 1;
             live.errors.store(errs, Ordering::Relaxed);
             wait_while_bus_off(live);
@@ -1758,17 +1789,40 @@ struct LiveState {
     sent: AtomicU64,
     errors: AtomicU64,
     bus_off: AtomicBool,
+    /// CTRL_ACTIVE / CTRL_WARNING / CTRL_PASSIVE from the controller's
+    /// CAN_ERR_CRTL frames.
+    ctrl_state: AtomicU8,
+    /// Frames the controller reported as un-ACKed (CAN_ERR_ACK).
+    no_ack: AtomicU64,
+    /// Last TX / RX error counters (CAN_ERR_CNT), when the driver reports them.
+    tec: AtomicU8,
+    rec: AtomicU8,
+    /// `--on-error pause`: hold transmission while ERROR-PASSIVE.
+    pause_on_passive: AtomicBool,
     running: AtomicBool,
 }
 
 impl LiveState {
-    fn new() -> Arc<Self> {
+    fn new(pause_on_passive: bool) -> Arc<Self> {
         Arc::new(Self {
             sent: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             bus_off: AtomicBool::new(false),
+            ctrl_state: AtomicU8::new(CTRL_ACTIVE),
+            no_ack: AtomicU64::new(0),
+            tec: AtomicU8::new(0),
+            rec: AtomicU8::new(0),
+            pause_on_passive: AtomicBool::new(pause_on_passive),
             running: AtomicBool::new(true),
         })
+    }
+
+    /// True while the send path should hold: BUS-OFF always, ERROR-PASSIVE
+    /// only with `--on-error pause`.
+    fn should_hold(&self) -> bool {
+        self.bus_off.load(Ordering::Relaxed)
+            || (self.pause_on_passive.load(Ordering::Relaxed)
+                && self.ctrl_state.load(Ordering::Relaxed) == CTRL_PASSIVE)
     }
 }
 
@@ -1871,6 +1925,51 @@ fn err_monitor_thread(state: Arc<LiveState>, ifname: String, quiet: bool, auto_r
             continue;
         }
         let err_class = frame.can_id & !CAN_ERR_FLAG;
+        if err_class & CAN_ERR_CNT != 0 {
+            state.tec.store(frame.data[6], Ordering::Relaxed);
+            state.rec.store(frame.data[7], Ordering::Relaxed);
+        }
+        if err_class & CAN_ERR_ACK != 0 {
+            let n = state.no_ack.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 && !quiet {
+                eprintln!(
+                    "\nmcangen: no ACK on '{}' -- no other node is receiving (wiring, termination, bitrate?)",
+                    ifname,
+                );
+            }
+        }
+        if err_class & CAN_ERR_CRTL != 0 {
+            let c = frame.data[1];
+            let new_state = if c & (CAN_ERR_CRTL_TX_PASSIVE | CAN_ERR_CRTL_RX_PASSIVE) != 0 {
+                CTRL_PASSIVE
+            } else if c & (CAN_ERR_CRTL_TX_WARNING | CAN_ERR_CRTL_RX_WARNING) != 0 {
+                CTRL_WARNING
+            } else if c & CAN_ERR_CRTL_ACTIVE != 0 {
+                CTRL_ACTIVE
+            } else {
+                state.ctrl_state.load(Ordering::Relaxed)
+            };
+            let old_state = state.ctrl_state.swap(new_state, Ordering::Relaxed);
+            if old_state != new_state && !quiet {
+                match new_state {
+                    CTRL_PASSIVE => {
+                        let action = if state.pause_on_passive.load(Ordering::Relaxed) {
+                            "holding transmission (--on-error pause)"
+                        } else {
+                            "frames may not reach the wire (use --on-error pause to hold)"
+                        };
+                        eprintln!("\nmcangen: '{}' is ERROR-PASSIVE -- {}", ifname, action);
+                    }
+                    CTRL_WARNING if old_state == CTRL_ACTIVE => {
+                        eprintln!("\nmcangen: '{}' is ERROR-WARNING", ifname);
+                    }
+                    CTRL_ACTIVE => {
+                        eprintln!("\nmcangen: '{}' back to ERROR-ACTIVE -- resuming", ifname);
+                    }
+                    _ => {}
+                }
+            }
+        }
         if err_class & CAN_ERR_BUSOFF != 0 {
             let was_off = state.bus_off.swap(true, Ordering::Relaxed);
             if !was_off && !quiet {
@@ -1946,25 +2045,38 @@ fn err_monitor_thread(state: Arc<LiveState>, ifname: String, quiet: bool, auto_r
     }
 }
 
-/// Block while `state.bus_off` is set, using a short exponential backoff
+/// Block while the send path must hold (BUS-OFF, or ERROR-PASSIVE with
+/// `--on-error pause`), using a short exponential backoff
 /// (100ms → 5s). Returns `true` if we actually waited (caller should reset
 /// rate-limit baselines), `false` if the bus was online from the start.
 fn wait_while_bus_off(state: &LiveState) -> bool {
-    if !state.bus_off.load(Ordering::Relaxed) {
+    if !state.should_hold() {
         return false;
     }
     let mut delay = Duration::from_millis(100);
     let max_delay = Duration::from_secs(5);
-    while state.bus_off.load(Ordering::Relaxed) && state.running.load(Ordering::Relaxed) {
+    while state.should_hold() && state.running.load(Ordering::Relaxed) {
         std::thread::sleep(delay);
         delay = (delay * 2).min(max_delay);
     }
     true
 }
 
+/// Frames the driver actually completed on the wire (sysfs tx_packets).
+/// Unlike `sent`, which counts successful `write()`s into the kernel queue,
+/// this only moves once the controller got an ACK. `None` if unreadable.
+fn wire_tx_packets(interface: &str) -> Option<u64> {
+    std::fs::read_to_string(format!("/sys/class/net/{}/statistics/tx_packets", interface))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 fn stats_thread(state: Arc<LiveState>, interface: String) {
     let start = Instant::now();
     let mut prev_sent: u64 = 0;
+    let wire_base = wire_tx_packets(&interface);
 
     while state.running.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_secs(1));
@@ -1982,14 +2094,36 @@ fn stats_thread(state: Arc<LiveState>, interface: String) {
         };
         prev_sent = sent;
 
-        let state_tag = if state.bus_off.load(Ordering::Relaxed) {
-            " | BUS-OFF"
+        // Bus health: controller state, un-ACKed frames, error counters, and
+        // how many frames the driver really completed on the wire.
+        let mut tag = String::new();
+        if state.bus_off.load(Ordering::Relaxed) {
+            tag.push_str(" | BUS-OFF");
         } else {
-            ""
-        };
+            match state.ctrl_state.load(Ordering::Relaxed) {
+                CTRL_PASSIVE => tag.push_str(" | ERROR-PASSIVE"),
+                CTRL_WARNING => tag.push_str(" | ERROR-WARNING"),
+                _ => {}
+            }
+        }
+        let no_ack = state.no_ack.load(Ordering::Relaxed);
+        if no_ack > 0 {
+            tag.push_str(&format!(" | no-ack {}", no_ack));
+        }
+        let tec = state.tec.load(Ordering::Relaxed);
+        let rec = state.rec.load(Ordering::Relaxed);
+        if tec > 0 || rec > 0 {
+            tag.push_str(&format!(" | tec {} rec {}", tec, rec));
+        }
+        if let (Some(base), Some(now)) = (wire_base, wire_tx_packets(&interface)) {
+            let wire = now.saturating_sub(base);
+            if wire != sent {
+                tag.push_str(&format!(" | wire {}", wire));
+            }
+        }
         eprint!(
             "\r{}: {} frames | {:.0} fps (avg {:.0}) | {} err | {:.1}s{}    ",
-            interface, sent, instant_fps, avg_fps, errors, elapsed, state_tag,
+            interface, sent, instant_fps, avg_fps, errors, elapsed, tag,
         );
     }
     eprintln!();
@@ -2159,7 +2293,7 @@ fn run_fd_generation(
     if max_rate {
         let mut batch = [empty; BATCH_SIZE];
         'send: loop {
-            if live.bus_off.load(Ordering::Relaxed) {
+            if live.should_hold() {
                 errors += 1;
                 live.errors.store(errors, Ordering::Relaxed);
                 wait_while_bus_off(live);
@@ -2244,7 +2378,7 @@ fn run_fd_generation(
     } else {
         let mut frame = empty;
         while unlimited || sent < cli.count {
-            if live.bus_off.load(Ordering::Relaxed) {
+            if live.should_hold() {
                 errors += 1;
                 live.errors.store(errors, Ordering::Relaxed);
                 wait_while_bus_off(live);
@@ -2419,7 +2553,7 @@ fn main() {
     });
 
     // ── Live monitoring threads ──
-    let live = LiveState::new();
+    let live = LiveState::new(cli.on_error == OnError::Pause);
 
     // Bus-state monitor: listens for CAN error frames so we know when the
     // controller goes BUS-OFF (which is invisible to write()).
@@ -2592,7 +2726,7 @@ fn main() {
         let mut batch: [CanFrame; BATCH_SIZE] = [frame; BATCH_SIZE];
 
         'max_rate: loop {
-            if live.bus_off.load(Ordering::Relaxed) {
+            if live.should_hold() {
                 // Frames sent while BUS-OFF wouldn't reach the wire — pause
                 // and count an error rather than lying about throughput.
                 errors += 1;
@@ -2746,7 +2880,7 @@ fn main() {
                 break;
             }
 
-            if live.bus_off.load(Ordering::Relaxed) {
+            if live.should_hold() {
                 errors += 1;
                 live.errors.store(errors, Ordering::Relaxed);
                 wait_while_bus_off(&live);

@@ -97,7 +97,10 @@ CAN-FD.
 - **Resilient** — survives the interface vanishing and coming back
   (admin-down, removal, USB unplug); detects controller BUS-OFF via CAN
   error frames and pauses transmission instead of silently counting
-  phantom sends; with `--auto-restart` cycles the interface via netlink
+  phantom sends; shows ERROR-WARNING / ERROR-PASSIVE, un-ACKed frames,
+  error counters and the on-wire frame count in the stats line, and can
+  hold while ERROR-PASSIVE (`--on-error pause`); with `--auto-restart`
+  cycles the interface via netlink
   to recover from BUS-OFF on drivers that lack kernel auto-restart
   (notably `gs_usb` / candleLight / Canable v1)
 - **Minimal dependencies** — just `clap`, `libc`, `nix`, and `fastrand`
@@ -293,6 +296,7 @@ mcangen can0 -n 10000 -q && echo "done"
 | `--no-obd` | [UDS flash] Skip OBD-II polling between sessions | off |
 | `--no-errors` | [UDS flash] Disable error injection | off |
 | `--auto-restart` | On BUS-OFF, cycle the interface via netlink to recover (needs `CAP_NET_ADMIN`) | off |
+| `--on-error` | While the controller is ERROR-PASSIVE: `continue` (send, show it in the stats line) or `pause` (hold until ERROR-ACTIVE) | `continue` |
 
 ### Makefile targets
 
@@ -366,6 +370,19 @@ are counted as errors instead of as phantom successes. On
 `CAN_ERR_RESTARTED` (kernel auto-restart, manual `ip link set <iface>
 type can restart`, or our own `--auto-restart`), transmission
 transparently resumes.
+
+**Nobody ACKs — ERROR-PASSIVE without BUS-OFF**: a node whose frames
+no other node acknowledges never reaches BUS-OFF: per spec its TX error
+counter stops at 128, so it sits in ERROR-PASSIVE retrying the same
+frame forever while `write()` keeps succeeding into the qdisc (default
+`qlen` 10, often raised to thousands). The error socket therefore also
+subscribes to `CRTL | ACK`: the stats line shows `ERROR-PASSIVE`,
+`no-ack <n>`, `tec/rec` and `wire <n>` (sysfs `tx_packets`, i.e. frames
+the driver really completed — shown whenever it differs from `frames`),
+and a one-shot message on stderr points at wiring / termination /
+bitrate. `--on-error pause` holds transmission until the controller
+reports ERROR-ACTIVE again; the default `continue` keeps sending, which
+is what you want when the far side is expected to come up later.
 
 **Recovery from BUS-OFF on uncooperative drivers**: not every CAN
 driver implements the kernel hook (`do_set_mode`) needed to honor
